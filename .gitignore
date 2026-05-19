@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+keys.json
+gurufocus_auth.json
+logs/*.log
+logs/captures/
+logs/capture-test/
+debug_*.png
+.playwright/
