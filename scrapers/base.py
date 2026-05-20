@@ -28,7 +28,7 @@ def _check_proxy_works(
     proxy_server: str,
     test_urls: tuple[str, ...] = (
         "https://valueinvesting.io",
-        "https://www.gurufocus.com",
+        "https://finance.yahoo.com/quote/MSFT/",
     ),
     timeout: float = 8,
 ) -> bool:
@@ -39,11 +39,12 @@ def _check_proxy_works(
         try:
             request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with opener.open(request, timeout=timeout) as response:
-                if response.status < 500:
-                    return True
+                if response.status >= 500:
+                    return False
         except (OSError, urllib.error.URLError) as exc:
             logger.info("Proxy check failed for %s via %s: %s", url, proxy_server, exc)
-    return False
+            return False
+    return True
 
 
 def get_playwright_proxy_config() -> Optional[dict[str, str]]:

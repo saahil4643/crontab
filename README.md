@@ -1,6 +1,6 @@
 # Raffay cron 62 — Daily Position Bullish Trader (DCF gap fill)
 
-Bi-weekly Python cron that fills **missing** DCF and price-target values on the Google Sheet **Missing Value** tab (values **D**, **I**, **O**, and **T–V**) using **Playwright** and a **JSON-first extraction pipeline**.
+Bi-weekly Python cron that refreshes DCF and price-target values on the Google Sheet **Missing Value** tab (values **D**, **I**, **O**, and **T–V**) using **Playwright** and a **JSON-first extraction pipeline**.
 
 **Full documentation:** [docs/FLOW.md](docs/FLOW.md)
 

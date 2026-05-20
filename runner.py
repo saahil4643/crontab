@@ -1,4 +1,4 @@
-"""Orchestrate missing-cell discovery, Playwright scraping, and sheet updates."""
+"""Orchestrate cell discovery, Playwright scraping, and sheet updates."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ def run(
     client = DcfSheetClient()
     logger.info("Worksheets: %s", client.list_worksheets())
 
-    jobs = client.collect_missing_jobs()
+    jobs = client.collect_jobs()
     if sources:
         jobs = [j for j in jobs if j.source in sources]
     if limit is not None:
@@ -111,11 +111,18 @@ def run(
                     raw = scrape_job(session, job)
                     if raw is not None:
                         value = format_for_sheet(raw)
-                        client.write_value(job, value)
                     else:
-                        logger.warning("No value for %s %s", job.ticker, job.label)
+                        value = "N/A"
+                        logger.warning(
+                            "No value for %s %s; writing %s",
+                            job.ticker,
+                            job.label,
+                            value,
+                        )
+                    client.write_value(job, value)
                 except Exception as exc:
                     logger.exception("Failed job %s: %s", job.ticker, exc)
+                    client.write_value(job, "N/A")
                 _delay_between_tickers()
 
         if batch_start + BATCH_SIZE < len(jobs):

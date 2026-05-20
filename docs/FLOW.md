@@ -6,7 +6,7 @@ This document explains **what the cron does**, **how data moves through the code
 
 ## 1. Purpose
 
-**Cron 62** fills **missing** financial values on the Google Sheet **Missing Value** tab:
+**Cron 62** refreshes financial values on the Google Sheet **Missing Value** tab:
 
 | Source site | Index | Ticker | Value column | Sheet header |
 |-------------|-------|--------|--------------|--------------|
@@ -17,7 +17,7 @@ This document explains **what the cron does**, **how data moves through the code
 
 - **Schedule (business):** about every 2 weeks  
 - **Spreadsheet:** [Daily Position Bullish Trader](https://docs.google.com/spreadsheets/d/1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs/edit)  
-- **Behavior:** data from row 3; each source has its own ticker block; fill **D**, **I**, **O**, and **T–V** when empty or placeholder (`N/A`, `0.00%`, etc.)  
+- **Behavior:** data from row 3; each source has its own ticker block; overwrite **D**, **I**, **O**, and **T–V** with fresh values, or `N/A` when a source has no value.  
 - **Production:** `xvfb-run -a python run.py` (virtual display for GuruFocus on Linux)
 
 ---
@@ -96,7 +96,7 @@ If all steps fail and `SAVE_DEBUG_ON_FAILURE` is true, artifacts are saved under
 
 | File | Role |
 |------|------|
-| `sheet_client.py` | `collect_missing_jobs()`, `write_value()`. |
+| `sheet_client.py` | `collect_jobs()`, `write_value()`. |
 | `models.py` | `ScrapeJob` dataclass (row, ticker, source, column). |
 | `sheet_utils.py` | Column letter ↔ index (`K` → 11). |
 
@@ -225,8 +225,8 @@ Cron 62 combines **cron 57 operations** with **step 53/54 sites** and the **JSON
 | Term | Meaning |
 |------|---------|
 | **DCF** | Discounted cash flow fair value (dollar amount). |
-| **Missing cell** | Empty or listed in `MISSING_PLACEHOLDERS`. |
-| **Job** | One ticker + one value column to fill. |
+| **Missing value** | Written as `N/A` when a source cannot return a usable value. |
+| **Job** | One ticker + one value column to refresh. |
 | **Batch** | Up to `BATCH_SIZE` jobs sharing one browser instance. |
 | **Capture** | JSON (+ HTML) collected during `page.goto`. |
 
