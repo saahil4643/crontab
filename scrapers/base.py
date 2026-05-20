@@ -3,15 +3,73 @@
 from __future__ import annotations
 
 import logging
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
-from config import DEBUG_CAPTURES_DIR, HEADLESS, SCRAPE_RETRIES, USER_AGENT
+from config import (
+    DEBUG_CAPTURES_DIR,
+    DISABLE_PROXY,
+    HEADLESS,
+    PLAYWRIGHT_PROXY,
+    SCRAPE_RETRIES,
+    USER_AGENT,
+)
 from scrapers.extract import ExtractionResult, run_extraction_pipeline, run_price_target_pipeline
 
 logger = logging.getLogger(__name__)
+_playwright_proxy_config: Optional[dict[str, str]] | bool = False
+
+
+def _check_proxy_works(
+    proxy_server: str,
+    test_urls: tuple[str, ...] = (
+        "https://valueinvesting.io",
+        "https://www.gurufocus.com",
+    ),
+    timeout: float = 8,
+) -> bool:
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_server, "https": proxy_server})
+    )
+    for url in test_urls:
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with opener.open(request, timeout=timeout) as response:
+                if response.status < 500:
+                    return True
+        except (OSError, urllib.error.URLError) as exc:
+            logger.info("Proxy check failed for %s via %s: %s", url, proxy_server, exc)
+    return False
+
+
+def get_playwright_proxy_config() -> Optional[dict[str, str]]:
+    """Use the cron 53/54 proxy pattern, but fall back to direct connection."""
+    global _playwright_proxy_config
+    if _playwright_proxy_config is not False:
+        return _playwright_proxy_config
+
+    if DISABLE_PROXY:
+        logger.info("Playwright proxy disabled via DISABLE_PROXY")
+        _playwright_proxy_config = None
+        return None
+
+    proxy_server = (PLAYWRIGHT_PROXY or "").strip()
+    if not proxy_server or proxy_server.lower() == "none":
+        _playwright_proxy_config = None
+        return None
+
+    if _check_proxy_works(proxy_server):
+        logger.info("Playwright proxy OK: %s", proxy_server)
+        _playwright_proxy_config = {"server": proxy_server}
+    else:
+        logger.warning("Playwright proxy not reachable; using direct connection")
+        _playwright_proxy_config = None
+
+    return _playwright_proxy_config
 
 
 class PlaywrightSession:
@@ -33,17 +91,26 @@ class PlaywrightSession:
 
     def start(self) -> None:
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            headless=self._headless,
-            args=[
+        launch_kwargs: dict = {
+            "headless": self._headless,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--window-size=1920,1080",
+                f"--user-agent={USER_AGENT}",
             ],
+        }
+        proxy_config = get_playwright_proxy_config()
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+        self._browser = self._playwright.chromium.launch(
+            **launch_kwargs,
         )
         context_kwargs: dict = {
             "user_agent": USER_AGENT,
             "locale": "en-US",
+            "timezone_id": "America/New_York",
             "viewport": {"width": 1920, "height": 1080},
         }
         if self._storage_state and self._storage_state.is_file():

@@ -1,8 +1,8 @@
 """
-GuruFocus DCF — https://www.gurufocus.com/dcf-calculator?ticker={TICKER}
+GuruFocus DCF — https://www.gurufocus.com/stock/{TICKER}/dcf
 
-Fair Value (DCF output) is read from the calculator page DOM (.stock-dcf-table),
-not from generic network JSON captures.
+Fair Value (DCF output) is read from the GuruFocus stock DCF page DOM
+(.stock-dcf-table), not from generic network JSON captures.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from scrapers.extract import ExtractionResult, normalize_numeric_string
 
 logger = logging.getLogger(__name__)
 
-# Browser-side scan for Fair Value row in DCF calculator tables
+# Browser-side scan for Fair Value row in GuruFocus DCF tables
 _EXTRACT_FAIR_VALUE_JS = """
 () => {
   const parseDollar = (text) => {
@@ -84,8 +84,8 @@ _DOLLAR_RE = re.compile(
 )
 
 
-def prepare_dcf_calculator_page(page: Page) -> None:
-    """Dismiss overlays and wait for calculator tables after navigation."""
+def prepare_dcf_page(page: Page) -> None:
+    """Dismiss overlays and wait for GuruFocus DCF tables after navigation."""
     for label in ("Accept", "Accept All", "I agree", "Got it"):
         try:
             page.get_by_role("button", name=label).click(timeout=2000)
@@ -105,7 +105,7 @@ def prepare_dcf_calculator_page(page: Page) -> None:
 
     page.wait_for_timeout(GURUFOCUS_PAGE_SETTLE_MS)
 
-    # Wait up to 90s for Vue/DCF model to write Fair Value (no login required if site allows)
+    # Wait up to 90s for the client-rendered DCF model to write Fair Value.
     try:
         page.wait_for_function(
             _FAIR_VALUE_READY_JS,
@@ -119,9 +119,9 @@ def prepare_dcf_calculator_page(page: Page) -> None:
         )
 
 
-def extract_fair_value_from_dcf_calculator(page: Page) -> Optional[str]:
+def extract_fair_value_from_dcf_page(page: Page) -> Optional[str]:
     """
-    Extract Fair Value from https://www.gurufocus.com/dcf-calculator page.
+    Extract Fair Value from https://www.gurufocus.com/stock/{ticker}/dcf page.
     Tries JS row scan, Playwright locators, then legacy CSS selectors.
     """
     # 1) JavaScript — Fair Value row in .stock-dcf-table
@@ -198,26 +198,26 @@ def extract_fair_value_from_dcf_calculator(page: Page) -> Optional[str]:
     return None
 
 
-def _calculator_model_ran(page: Page) -> bool:
+def _dcf_model_ran(page: Page) -> bool:
     """True if Growth/Terminal value areas show numbers (not just '$')."""
     try:
-        text = page.locator(".dcf-calculator").first.inner_text(timeout=5000)
+        text = page.locator("body").inner_text(timeout=5000)
         return bool(re.search(r"Growth Value[\s\S]{0,80}\$\s*[\d,]+\.?\d+", text, re.I))
     except Exception:
         return False
 
 
-def wait_for_fair_value_on_calculator(page: Page) -> Optional[str]:
+def wait_for_fair_value_on_dcf_page(page: Page) -> Optional[str]:
     """Poll until Fair Value appears or attempts exhausted."""
     for attempt in range(1, GURUFOCUS_FAIR_VALUE_POLL_ATTEMPTS + 1):
-        value = extract_fair_value_from_dcf_calculator(page)
+        value = extract_fair_value_from_dcf_page(page)
         if value is not None:
             logger.info("GuruFocus Fair Value ready on poll %d: %s", attempt, value)
             return value
         if attempt < GURUFOCUS_FAIR_VALUE_POLL_ATTEMPTS:
             page.wait_for_timeout(GURUFOCUS_FAIR_VALUE_POLL_INTERVAL_MS)
 
-    if not _calculator_model_ran(page):
+    if not _dcf_model_ran(page):
         logger.warning(
             "GuruFocus DCF model did not populate (Growth/Terminal values empty). "
             "Headless Chrome may be blocked — retry with: "
@@ -228,8 +228,8 @@ def wait_for_fair_value_on_calculator(page: Page) -> Optional[str]:
 
 class GuruFocusScraper(BaseScraper):
     """
-    Scrapes DCF Fair Value from GuruFocus DCF Calculator only.
-    URL: https://www.gurufocus.com/dcf-calculator?ticker={ticker}
+    Scrapes DCF Fair Value from GuruFocus stock DCF page.
+    URL: https://www.gurufocus.com/stock/{ticker}/dcf
     """
 
     source_key = "gurufocus"
@@ -237,18 +237,18 @@ class GuruFocusScraper(BaseScraper):
 
     def scrape(self, page: Page, ticker: str) -> Optional[str]:
         url = GURUFOCUS_DCF_URL.format(ticker=ticker.strip().upper())
-        logger.info("[%s] DCF Calculator %s", self.source_label, url)
+        logger.info("[%s] DCF page %s", self.source_label, url)
 
         for attempt in range(1, SCRAPE_RETRIES + 1):
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-                prepare_dcf_calculator_page(page)
-                value = wait_for_fair_value_on_calculator(page)
+                prepare_dcf_page(page)
+                value = wait_for_fair_value_on_dcf_page(page)
                 if value is not None:
                     return value
 
                 logger.warning(
-                    "[%s] %s attempt %d: Fair Value not found on calculator page",
+                    "[%s] %s attempt %d: Fair Value not found on DCF page",
                     self.source_label,
                     ticker,
                     attempt,
@@ -270,4 +270,4 @@ class GuruFocusScraper(BaseScraper):
         value = self.scrape(page, ticker)
         if value is None:
             return None
-        return ExtractionResult(value=value, method="dcf_calculator_dom")
+        return ExtractionResult(value=value, method="stock_dcf_dom")

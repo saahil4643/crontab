@@ -1,6 +1,6 @@
 # Raffay cron 62 — Daily Position Bullish Trader (DCF gap fill)
 
-Bi-weekly Python cron that fills **missing** DCF and price-target values on the Google Sheet **Missing Value** tab (tickers **AC**, values **AD–AI**) using **Playwright** and a **JSON-first extraction pipeline**.
+Bi-weekly Python cron that fills **missing** DCF and price-target values on the Google Sheet **Missing Value** tab (values **D**, **I**, **O**, and **T–V**) using **Playwright** and a **JSON-first extraction pipeline**.
 
 **Full documentation:** [docs/FLOW.md](docs/FLOW.md)
 
@@ -20,14 +20,14 @@ Place credentials at **`/usr/local/share/keys.json`** and share the spreadsheet 
 
 ## Production run
 
-```bash
-chmod +x scripts/run_production.sh
-./scripts/run_production.sh --dry-run
-./scripts/run_production.sh --source gurufocus --limit 5
-./scripts/run_production.sh
-```
+Use **xvfb-run** on Linux so GuruFocus DCF pages can run (headless Chrome alone often returns no Fair Value):
 
-`run_production.sh` uses **xvfb-run** so GuruFocus DCF calculator can run (headless Chrome alone often returns no Fair Value).
+```bash
+source venv/bin/activate
+xvfb-run -a python run.py --dry-run
+xvfb-run -a python run.py --source gurufocus --limit 5
+xvfb-run -a python run.py
+```
 
 Environment overrides:
 
@@ -46,11 +46,12 @@ python run.py --source gurufocus --limit 1 --headed
 
 ## Sheet layout (Missing Value)
 
-| Column | Role |
-|--------|------|
-| AB | Index (e.g. Nasdaq) → Alpha Spread URL |
-| AC | Ticker |
-| AD–AI | Alpha Spread, ValueIo, GuruFocus, PT Low/Avg/High |
+| Columns | Role |
+|---------|------|
+| B/C/D | Alpha Spread index, ticker, value |
+| G/H/I | ValueIo index, ticker, value |
+| M/N/O | GuruFocus index, ticker, value |
+| R/S/T–V | Price target index, ticker, Low/Avg/High |
 
 Data rows start at **row 3**.
 

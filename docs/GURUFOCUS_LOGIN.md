@@ -1,13 +1,13 @@
-# GuruFocus DCF Calculator — login (optional)
+# GuruFocus Stock DCF Page — login (optional)
 
-Fair Value on https://www.gurufocus.com/dcf-calculator is filled by a **client-side DCF model** and may take **30–90 seconds** to appear even **without login**. The scraper waits up to ~2 minutes (poll + `wait_for_function`).
+Fair Value on https://www.gurufocus.com/stock/AAPL/dcf is filled by a **client-side DCF model** and may take **30–90 seconds** to appear even **without login**. The scraper waits up to ~2 minutes (poll + `wait_for_function`).
 
 If Fair Value stays empty after that, GuruFocus may require a **subscription / login** (save session below).
 
 ## Save a logged-in browser session (one time)
 
 ```bash
-playwright codegen https://www.gurufocus.com/dcf-calculator?ticker=AAPL \
+playwright codegen https://www.gurufocus.com/stock/AAPL/dcf \
   --save-storage=gurufocus_auth.json
 ```
 

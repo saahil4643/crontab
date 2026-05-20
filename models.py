@@ -17,4 +17,4 @@ class ScrapeJob:
     value_col: str
     value_col_index: int
     label: str
-    security_type: str = "nasdaq"  # Alpha Spread URL segment from column AB
+    security_type: str = "nasdaq"  # Alpha Spread URL segment from the source block's index column

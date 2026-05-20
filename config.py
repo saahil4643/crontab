@@ -25,7 +25,7 @@ SHEET_URL = (
 )
 SHEET_ID = "1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs"
 
-# Production writes the Missing Value tab (tickers AC, values AD–AI).
+# Production writes the Missing Value tab source blocks (D, I, O, T:V).
 WORKSHEET_MISSING_VALUE = "Missing Value"
 WORKSHEET_MISSING_VALUE_GID = 714988304
 # Legacy tab — not used by cron 62 production run
@@ -38,17 +38,19 @@ GOOGLE_SCOPES = [
 CREDENTIALS_PRIMARY = "/usr/local/share/keys.json"
 
 # --- Scraping ---
-# Server: use xvfb-run (see scripts/run_production.sh). GuruFocus needs a real display path.
+# Server: use xvfb-run around run.py. GuruFocus needs a real display path.
 HEADLESS = _env_bool("HEADLESS", True)
 # When True, batches that include GuruFocus run Chromium with headless=False (required on Linux).
 GURUFOCUS_USE_HEADED = _env_bool("GURUFOCUS_USE_HEADED", True)
+PLAYWRIGHT_PROXY = os.environ.get("PLAYWRIGHT_PROXY", "http://127.0.0.1:10809")
+DISABLE_PROXY = _env_bool("DISABLE_PROXY", False)
 BATCH_SIZE = 50
 DELAY_BETWEEN_TICKERS_SEC = (3, 7)
 DELAY_BETWEEN_BATCHES_SEC = 15
 SCRAPE_RETRIES = 3
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
 
 # Treat these as empty / needs refill
@@ -99,18 +101,8 @@ DCF_SOURCE_BLOCKS: tuple[SheetColumnBlock, ...] = (
     SheetColumnBlock("price_target_high", "M", "N", "Q", "Price Target High"),
 )
 
-# Missing Value tab layout (row 1 = summary, row 2 = headers, data from row 3)
+# Missing Value tab layout (row 1 = summary, row 2 = source headers, data from row 3)
 MISSING_VALUE_START_ROW = 3
-MISSING_VALUE_INDEX_COL = "AB"  # e.g. Nasdaq → Alpha Spread URL segment
-MISSING_VALUE_TICKER_COL = "AC"
-MISSING_VALUE_COLUMNS: dict[SourceKey, str] = {
-    "alphaspread": "AD",
-    "valueinvesting": "AE",
-    "gurufocus": "AF",
-    "price_target_low": "AG",
-    "price_target_avg": "AH",
-    "price_target_high": "AI",
-}
 MISSING_VALUE_SOURCE_LABELS: dict[SourceKey, str] = {
     "alphaspread": "Alpha Spread",
     "valueinvesting": "ValueIo",
@@ -119,14 +111,14 @@ MISSING_VALUE_SOURCE_LABELS: dict[SourceKey, str] = {
     "price_target_avg": "Price Target Average",
     "price_target_high": "Price Target High",
 }
-# Order used when scanning rows (one ticker row → up to six cells)
-MISSING_VALUE_SOURCE_ORDER: tuple[SourceKey, ...] = (
-    "alphaspread",
-    "valueinvesting",
-    "gurufocus",
-    "price_target_low",
-    "price_target_avg",
-    "price_target_high",
+# Each source block has its own index/ticker columns and value column on Missing Value.
+MISSING_VALUE_BLOCKS: tuple[SheetColumnBlock, ...] = (
+    SheetColumnBlock("alphaspread", "B", "C", "D", "Alpha Spread"),
+    SheetColumnBlock("valueinvesting", "G", "H", "I", "ValueIo"),
+    SheetColumnBlock("gurufocus", "M", "N", "O", "GuruFocus"),
+    SheetColumnBlock("price_target_low", "R", "S", "T", "Price Target Low"),
+    SheetColumnBlock("price_target_avg", "R", "S", "U", "Price Target Average"),
+    SheetColumnBlock("price_target_high", "R", "S", "V", "Price Target High"),
 )
 
 # --- Source URLs ---
@@ -134,12 +126,9 @@ ALPHA_SPREAD_URL = (
     "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case"
 )
 VALUE_INVESTING_URL = "https://valueinvesting.io/{ticker}/valuation/dcf-growth-exit-5y"
-# Required GuruFocus entry point for DCF / Fair Value (see scrapers/gurufocus.py)
-GURUFOCUS_CALCULATOR_URL = "https://www.gurufocus.com/dcf-calculator"
-GURUFOCUS_DCF_URL = f"{GURUFOCUS_CALCULATOR_URL}?ticker={{ticker}}"
-# Legacy alternate page — not used by cron 62
-GURUFOCUS_STOCK_DCF_URL = "https://www.gurufocus.com/stock/{ticker}/dcf"
-# DCF calculator is client-rendered; Fair Value can take 30–90s without login
+# GuruFocus DCF / Fair Value entry point (see scrapers/gurufocus.py)
+GURUFOCUS_DCF_URL = "https://www.gurufocus.com/stock/{ticker}/dcf"
+# DCF page is client-rendered; Fair Value can take 30–90s without login
 GURUFOCUS_FAIR_VALUE_POLL_ATTEMPTS = 45
 GURUFOCUS_FAIR_VALUE_POLL_INTERVAL_MS = 2000
 GURUFOCUS_PAGE_SETTLE_MS = 5000

@@ -5,10 +5,9 @@ Raffay cron 62 — fill missing DCF / price-target values on Missing Value tab.
 Test JSON only (no Google Sheet):
   python scripts/capture_json.py --source gurufocus --ticker AAPL --try-extract
 
-Production (server — use virtual display for GuruFocus):
-  scripts/run_production.sh --dry-run
-  scripts/run_production.sh --source gurufocus --limit 5
-  python run.py --dry-run
+Production (server — use xvfb-run for GuruFocus on Linux):
+  xvfb-run -a python run.py --dry-run
+  xvfb-run -a python run.py --source gurufocus --limit 5
 """
 
 from __future__ import annotations

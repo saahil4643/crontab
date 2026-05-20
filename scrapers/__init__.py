@@ -5,9 +5,9 @@ from scrapers.extract import ExtractionResult, format_for_sheet, run_extraction_
 from scrapers.alpha_spread import AlphaSpreadScraper
 from scrapers.gurufocus import (
     GuruFocusScraper,
-    extract_fair_value_from_dcf_calculator,
-    prepare_dcf_calculator_page,
-    wait_for_fair_value_on_calculator,
+    extract_fair_value_from_dcf_page,
+    prepare_dcf_page,
+    wait_for_fair_value_on_dcf_page,
 )
 from scrapers.price_target import PriceTargetScraper
 from scrapers.value_investing import ValueInvestingScraper

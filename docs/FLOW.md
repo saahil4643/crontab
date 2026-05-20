@@ -10,15 +10,15 @@ This document explains **what the cron does**, **how data moves through the code
 
 | Source site | Index | Ticker | Value column | Sheet header |
 |-------------|-------|--------|--------------|--------------|
-| Alpha Spread | AB | AC | AD | Alpha Spread |
-| ValueInvesting.io | AB | AC | AE | ValueIo |
-| GuruFocus | AB | AC | AF | GuruFocus |
-| Price targets | AB | AC | AG / AH / AI | Low / Avg / High |
+| Alpha Spread | B | C | D | Alpha Spread |
+| ValueInvesting.io | G | H | I | ValueIo |
+| GuruFocus | M | N | O | GuruFocus |
+| Price targets | R | S | T / U / V | Low / Avg / High |
 
 - **Schedule (business):** about every 2 weeks  
 - **Spreadsheet:** [Daily Position Bullish Trader](https://docs.google.com/spreadsheets/d/1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs/edit)  
-- **Behavior:** data from row 3; ticker in **AC**; fill **AD–AI** when empty or placeholder (`N/A`, `0.00%`, etc.)  
-- **Production:** `./scripts/run_production.sh` (uses `xvfb-run` for GuruFocus on Linux)
+- **Behavior:** data from row 3; each source has its own ticker block; fill **D**, **I**, **O**, and **T–V** when empty or placeholder (`N/A`, `0.00%`, etc.)  
+- **Production:** `xvfb-run -a python run.py` (virtual display for GuruFocus on Linux)
 
 ---
 
@@ -112,9 +112,9 @@ If all steps fail and `SAVE_DEBUG_ON_FAILURE` is true, artifacts are saved under
 
 | File | URL constant | Notes |
 |------|--------------|--------|
-| `scrapers/alpha_spread.py` | `ALPHA_SPREAD_URL` | Default `security_type=nasdaq`; TODO: use Index column A. |
-| `scrapers/value_investing.py` | `VALUE_INVESTING_URL` | ValueIo column G. |
-| `scrapers/gurufocus.py` | `GURUFOCUS_DCF_URL` → `https://www.gurufocus.com/dcf-calculator?ticker=` | **Fair Value** from calculator DOM (not generic JSON). |
+| `scrapers/alpha_spread.py` | `ALPHA_SPREAD_URL` | Uses the source block's index column for the URL security type. |
+| `scrapers/value_investing.py` | `VALUE_INVESTING_URL` | ValueIo column I. |
+| `scrapers/gurufocus.py` | `GURUFOCUS_DCF_URL` → `https://www.gurufocus.com/stock/{ticker}/dcf` | **Fair Value** from stock DCF page DOM (not generic JSON). |
 | `scrapers/price_target.py` | Yahoo analysis URL (placeholder) | Separate JSON/regex keys per low/avg/high. |
 
 ---
@@ -145,8 +145,8 @@ Edit `config.py` when:
 | Change | What to edit |
 |--------|----------------|
 | New spreadsheet | `SHEET_URL`, `SHEET_ID` |
-| Tab renamed | `WORKSHEET_DCF_SOURCE` |
-| Column moved | `DCF_SOURCE_BLOCKS` |
+| Tab renamed | `WORKSHEET_MISSING_VALUE` |
+| Column moved | `MISSING_VALUE_BLOCKS` |
 | New JSON field name on a site | `DCF_JSON_KEY_HINTS` or site-specific hints |
 | Better text matching | `DCF_TEXT_REGEX_PATTERNS` |
 | Slower / faster cron | `DELAY_*`, `BATCH_SIZE` |
@@ -171,7 +171,7 @@ python run.py
 
 1. **Google Sheet shared** with the service account (`client_email` in `keys.json`) as Editor.  
 2. **Chromium** installed for Playwright.  
-3. Tab name **DCF Source** must exist (or update `config.py`).
+3. Tab name **Missing Value** must exist (or update `config.py`).
 
 ---
 
@@ -190,7 +190,7 @@ python run.py
 
 ## 9. Adding a new data source
 
-1. Add a `SourceKey` in `config.py` and a `SheetColumnBlock` in `DCF_SOURCE_BLOCKS`.  
+1. Add a `SourceKey` in `config.py` and a `SheetColumnBlock` in `MISSING_VALUE_BLOCKS`.  
 2. Create `scrapers/new_site.py` subclassing `BaseScraper`.  
 3. Implement `scrape()` using `_run_with_retries` + `_pipeline_dcf`.  
 4. Register in `scrapers/__init__.py` → `SCRAPERS_BY_SOURCE`.  
@@ -240,7 +240,7 @@ Use this **before** the client shares their spreadsheet or when tuning `DCF_JSON
 
 ```bash
 python scripts/capture_json.py --source gurufocus --ticker AAPL
-# Prints live Fair Value from DCF Calculator DOM + saves JSON/HTML
+# Prints live Fair Value from GuruFocus stock DCF DOM + saves JSON/HTML
 python scripts/capture_json.py --source alphaspread --ticker MSFT --try-extract
 python scripts/capture_json.py --list-sources
 ```
@@ -264,7 +264,7 @@ logs/capture-test/
   gurufocus_AAPL.html            # optional full page
 ```
 
-1. **GuruFocus:** use `python scripts/capture_json.py --source gurufocus --ticker AAPL` — look for **“Fair Value (live DOM)”** (from `dcf-calculator`, not JSON files).  
+1. **GuruFocus:** use `python scripts/capture_json.py --source gurufocus --ticker AAPL` — look for **“Fair Value (live DOM)”** (from `/stock/{ticker}/dcf`, not JSON files).  
 2. Other sites: open `*_json_*.json` and find DCF-related fields; add keys to `DCF_JSON_KEY_HINTS`.  
 3. Re-run with `--try-extract` until extraction looks correct.
 

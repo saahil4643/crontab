@@ -1,4 +1,4 @@
-"""Google Sheets read/write for Missing Value tab (tickers AC, values AD–AI)."""
+"""Google Sheets read/write for Missing Value tab."""
 
 from __future__ import annotations
 
@@ -11,12 +11,8 @@ from gspread import Worksheet
 
 from config import (
     MISSING_PLACEHOLDERS,
-    MISSING_VALUE_COLUMNS,
-    MISSING_VALUE_INDEX_COL,
-    MISSING_VALUE_SOURCE_LABELS,
-    MISSING_VALUE_SOURCE_ORDER,
+    MISSING_VALUE_BLOCKS,
     MISSING_VALUE_START_ROW,
-    MISSING_VALUE_TICKER_COL,
     SHEET_ID,
     SHEET_URL,
     WORKSHEET_MISSING_VALUE,
@@ -28,6 +24,7 @@ from sheet_utils import col_letter_to_index, normalize_security_type
 logger = logging.getLogger(__name__)
 
 _ZERO_PERCENT = re.compile(r"^0+(\.0+)?\s*%$", re.IGNORECASE)
+_HEADER_TICKERS = frozenset({"STOCK NAME", "TICKER", "SYMBOL"})
 
 
 def is_missing(value: Optional[str]) -> bool:
@@ -60,7 +57,7 @@ class DcfSheetClient:
 
     def collect_missing_jobs(self, start_row: int = MISSING_VALUE_START_ROW) -> list[ScrapeJob]:
         """
-        Scan Missing Value: ticker in AC, index in AB; fill empty cells AD–AI.
+        Scan Missing Value source blocks and fill empty value columns.
         """
         jobs: list[ScrapeJob] = []
         all_values = self._worksheet.get_all_values()
@@ -68,29 +65,20 @@ class DcfSheetClient:
             logger.warning("Sheet is empty")
             return jobs
 
-        index_idx = col_letter_to_index(MISSING_VALUE_INDEX_COL) - 1
-        ticker_idx = col_letter_to_index(MISSING_VALUE_TICKER_COL) - 1
-        value_indices = {
-            source: col_letter_to_index(MISSING_VALUE_COLUMNS[source]) - 1
-            for source in MISSING_VALUE_SOURCE_ORDER
-        }
-
         max_row = len(all_values)
         for row_num in range(start_row, max_row + 1):
             row = all_values[row_num - 1]
-            ticker = ""
-            if ticker_idx < len(row):
-                ticker = str(row[ticker_idx]).strip().upper()
-            if not ticker:
-                continue
+            for block in MISSING_VALUE_BLOCKS:
+                index_idx = col_letter_to_index(block.index_col) - 1
+                ticker_idx = col_letter_to_index(block.ticker_col) - 1
+                value_idx = col_letter_to_index(block.value_col) - 1
 
-            index_cell = ""
-            if index_idx < len(row):
-                index_cell = str(row[index_idx]).strip()
-            security_type = normalize_security_type(index_cell)
+                ticker = ""
+                if ticker_idx < len(row):
+                    ticker = str(row[ticker_idx]).strip().upper()
+                if not ticker or ticker in _HEADER_TICKERS:
+                    continue
 
-            for source in MISSING_VALUE_SOURCE_ORDER:
-                value_idx = value_indices[source]
                 current = ""
                 if value_idx < len(row):
                     current = str(row[value_idx]).strip()
@@ -98,15 +86,19 @@ class DcfSheetClient:
                 if not is_missing(current):
                     continue
 
-                value_col = MISSING_VALUE_COLUMNS[source]
+                index_cell = ""
+                if index_idx < len(row):
+                    index_cell = str(row[index_idx]).strip()
+                security_type = normalize_security_type(index_cell)
+
                 jobs.append(
                     ScrapeJob(
                         row=row_num,
                         ticker=ticker,
-                        source=source,
-                        value_col=value_col,
-                        value_col_index=col_letter_to_index(value_col),
-                        label=MISSING_VALUE_SOURCE_LABELS[source],
+                        source=block.source,
+                        value_col=block.value_col,
+                        value_col_index=value_idx + 1,
+                        label=block.label,
                         security_type=security_type,
                     )
                 )

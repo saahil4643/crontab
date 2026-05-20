@@ -57,9 +57,9 @@ def _make_navigate(page, source: str, url: str, wait_until: str, timeout_ms: int
     def navigate() -> None:
         page.goto(url, wait_until=load_until, timeout=timeout_ms)
         if source == "gurufocus":
-            from scrapers.gurufocus import prepare_dcf_calculator_page
+            from scrapers.gurufocus import prepare_dcf_page
 
-            prepare_dcf_calculator_page(page)
+            prepare_dcf_page(page)
 
     return navigate
 
@@ -95,9 +95,9 @@ def capture_one(
             save_html=save_html,
         )
         if source == "gurufocus":
-            from scrapers.gurufocus import wait_for_fair_value_on_calculator
+            from scrapers.gurufocus import wait_for_fair_value_on_dcf_page
 
-            live_dcf = wait_for_fair_value_on_calculator(page)
+            live_dcf = wait_for_fair_value_on_dcf_page(page)
 
     save_debug_capture(capture, output_dir, source=source, ticker=ticker)
     base = output_dir / f"{source}_{''.join(c if c.isalnum() else '_' for c in ticker.upper())}"
@@ -144,7 +144,7 @@ def print_summary(
 
     if source == "gurufocus":
         print()
-        print("GuruFocus DCF Calculator Fair Value (live DOM):")
+        print("GuruFocus stock DCF Fair Value (live DOM):")
         print(f"  URL: {GURUFOCUS_DCF_URL.format(ticker=ticker)}")
         print(f"  Fair Value: {live_dcf!r}")
         if live_dcf is None:

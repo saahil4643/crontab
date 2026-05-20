@@ -31,7 +31,7 @@ def _delay_between_tickers() -> None:
 
 
 def _batch_headless(batch: list[ScrapeJob], *, force_headed: bool) -> bool:
-    """GuruFocus DCF calculator does not populate under headless Chrome on Linux."""
+    """GuruFocus DCF pages often do not populate under headless Chrome on Linux."""
     if force_headed:
         return False
     if GURUFOCUS_USE_HEADED and any(j.source == "gurufocus" for j in batch):

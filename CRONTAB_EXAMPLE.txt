@@ -6,8 +6,8 @@
 #   apt install xvfb  (for xvfb-run)
 #   pip install -r requirements.txt && playwright install chromium
 #
-# 0 2 */14 * * cd /var/www/PersonalProjects/ElyScriptsCodeLive/modified/raffay_cron-62_Daily-Position-Bullish-Trader-step && ./scripts/run_production.sh >> logs/cron.out 2>&1
+# 0 2 */14 * * cd /var/www/PersonalProjects/ElyScriptsCodeLive/modified/raffay_cron-62_Daily-Position-Bullish-Trader-step && xvfb-run -a ./venv/bin/python run.py >> logs/cron.out 2>&1
 #
 # Test first:
-#   ./scripts/run_production.sh --dry-run
-#   ./scripts/run_production.sh --source gurufocus --limit 3
+#   xvfb-run -a ./venv/bin/python run.py --dry-run
+#   xvfb-run -a ./venv/bin/python run.py --source gurufocus --limit 3
