@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from config import DEFAULT_SECURITY_TYPE
+from config import DEFAULT_SECURITY_TYPE, MISSING_PLACEHOLDERS
 
 # Sheet "Nasdaq" / "NYSE" → Alpha Spread path segment
 _EXCHANGE_ALIASES: dict[str, str] = {
@@ -12,6 +12,16 @@ _EXCHANGE_ALIASES: dict[str, str] = {
     "nysemkt": "nyse",
     "nyse american": "amex",
 }
+
+
+def is_missing_cell_value(value: str | None) -> bool:
+    """True when the value column is empty or a known missing placeholder."""
+    if value is None:
+        return True
+    normalized = str(value).strip()
+    if not normalized:
+        return True
+    return normalized in MISSING_PLACEHOLDERS
 
 
 def normalize_security_type(index_cell: str | None) -> str:

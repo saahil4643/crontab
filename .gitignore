@@ -3,9 +3,13 @@ __pycache__/
 venv/
 .venv/
 keys.json
+.env
 gurufocus_auth.json
 logs/*.log
+logs/*.out
 logs/captures/
 logs/capture-test/
 debug_*.png
 .playwright/
+browser-profile/
+.env

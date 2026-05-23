@@ -1,35 +1,13 @@
-"""Playwright scrapers per data source."""
-
-from scrapers.capture import NetworkCapture, PageCapture
-from scrapers.extract import ExtractionResult, format_for_sheet, run_extraction_pipeline
-from scrapers.alpha_spread import AlphaSpreadScraper
-from scrapers.gurufocus import (
-    GuruFocusScraper,
-    extract_fair_value_from_dcf_page,
-    prepare_dcf_page,
-    wait_for_fair_value_on_dcf_page,
+from scrapers.extract import (
+    extract_from_json_payloads,
+    extract_from_text,
+    format_for_sheet,
+    normalize_numeric_string,
 )
-from scrapers.price_target import PriceTargetScraper
-from scrapers.value_investing import ValueInvestingScraper
-
-SCRAPERS_BY_SOURCE = {
-    "alphaspread": AlphaSpreadScraper(),
-    "valueinvesting": ValueInvestingScraper(),
-    "gurufocus": GuruFocusScraper(),
-    "price_target_low": PriceTargetScraper(kind="low"),
-    "price_target_avg": PriceTargetScraper(kind="avg"),
-    "price_target_high": PriceTargetScraper(kind="high"),
-}
 
 __all__ = [
-    "SCRAPERS_BY_SOURCE",
-    "NetworkCapture",
-    "PageCapture",
-    "ExtractionResult",
+    "extract_from_json_payloads",
+    "extract_from_text",
     "format_for_sheet",
-    "run_extraction_pipeline",
-    "AlphaSpreadScraper",
-    "ValueInvestingScraper",
-    "GuruFocusScraper",
-    "PriceTargetScraper",
+    "normalize_numeric_string",
 ]

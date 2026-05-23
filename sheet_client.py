@@ -16,7 +16,7 @@ from config import (
 )
 from credentials import get_credentials
 from models import ScrapeJob
-from sheet_utils import col_letter_to_index, normalize_security_type
+from sheet_utils import col_letter_to_index, is_missing_cell_value, normalize_security_type
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +42,11 @@ class DcfSheetClient:
 
     def collect_jobs(self, start_row: int = MISSING_VALUE_START_ROW) -> list[ScrapeJob]:
         """
-        Scan Missing Value source blocks and process every ticker/value cell.
+        Scan Missing Value source blocks and queue jobs only where the value
+        column (D, I, O, T–V) is empty or a missing placeholder (e.g. N/A).
         """
         jobs: list[ScrapeJob] = []
+        skipped_filled = 0
         all_values = self._worksheet.get_all_values()
         if not all_values:
             logger.warning("Sheet is empty")
@@ -64,6 +66,13 @@ class DcfSheetClient:
                 if not ticker or ticker in _HEADER_TICKERS:
                     continue
 
+                current_value = ""
+                if value_idx < len(row):
+                    current_value = str(row[value_idx]).strip()
+                if not is_missing_cell_value(current_value):
+                    skipped_filled += 1
+                    continue
+
                 index_cell = ""
                 if index_idx < len(row):
                     index_cell = str(row[index_idx]).strip()
@@ -81,7 +90,11 @@ class DcfSheetClient:
                     )
                 )
 
-        logger.info("Found %d value cells to refresh", len(jobs))
+        logger.info(
+            "Found %d missing value cells to fill (%d skipped — already have data)",
+            len(jobs),
+            skipped_filled,
+        )
         return jobs
 
     def write_value(self, job: ScrapeJob, value: str) -> None:

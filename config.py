@@ -1,7 +1,3 @@
-"""
-Configuration for Raffay cron 62 — DCF / price-target gap fill.
-"""
-
 from __future__ import annotations
 
 import os
@@ -10,26 +6,14 @@ from pathlib import Path
 from typing import Literal
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
 _PACKAGE_DIR = Path(__file__).resolve().parent
 
-# --- Google Sheet ---
 SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs/edit"
 )
 SHEET_ID = "1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs"
-
-# Production writes the Missing Value tab source blocks (D, I, O, T:V).
 WORKSHEET_MISSING_VALUE = "Missing Value"
-WORKSHEET_MISSING_VALUE_GID = 714988304
-# Legacy tab — not used by cron 62 production run
-WORKSHEET_DCF_SOURCE = "DCF Source"
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -37,23 +21,12 @@ GOOGLE_SCOPES = [
 ]
 CREDENTIALS_PRIMARY = "/usr/local/share/keys.json"
 
-# --- Scraping ---
-# Server: use xvfb-run around run.py. GuruFocus needs a real display path.
-HEADLESS = _env_bool("HEADLESS", True)
-# When True, batches that include GuruFocus run Chromium with headless=False (required on Linux).
-GURUFOCUS_USE_HEADED = _env_bool("GURUFOCUS_USE_HEADED", True)
-PLAYWRIGHT_PROXY = os.environ.get("PLAYWRIGHT_PROXY", "http://127.0.0.1:10809")
-DISABLE_PROXY = _env_bool("DISABLE_PROXY", False)
-BATCH_SIZE = 50
-DELAY_BETWEEN_TICKERS_SEC = (3, 7)
-DELAY_BETWEEN_BATCHES_SEC = 15
-SCRAPE_RETRIES = 3
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
+PLAYWRIGHT_PROXY = os.environ.get("PLAYWRIGHT_PROXY", "http://127.0.0.1:10809")
 
-# Treat these as empty / needs refill
 MISSING_PLACEHOLDERS = frozenset({
     "",
     "N/A",
@@ -67,7 +40,7 @@ MISSING_PLACEHOLDERS = frozenset({
     "0%",
     "0.00%",
     "-",
-    "—",
+    "--",
 })
 
 SourceKey = Literal[
@@ -82,8 +55,6 @@ SourceKey = Literal[
 
 @dataclass(frozen=True)
 class SheetColumnBlock:
-    """One ticker + value pair on the DCF Source tab."""
-
     source: SourceKey
     index_col: str
     ticker_col: str
@@ -91,27 +62,7 @@ class SheetColumnBlock:
     label: str
 
 
-# DCF Source layout (from workbook screenshots)
-DCF_SOURCE_BLOCKS: tuple[SheetColumnBlock, ...] = (
-    SheetColumnBlock("alphaspread", "A", "B", "C", "Alpha Spread"),
-    SheetColumnBlock("valueinvesting", "E", "F", "G", "ValueIo"),
-    SheetColumnBlock("gurufocus", "I", "J", "K", "GuruFocus"),
-    SheetColumnBlock("price_target_low", "M", "N", "O", "Price Target Low"),
-    SheetColumnBlock("price_target_avg", "M", "N", "P", "Price Target Average"),
-    SheetColumnBlock("price_target_high", "M", "N", "Q", "Price Target High"),
-)
-
-# Missing Value tab layout (row 1 = summary, row 2 = source headers, data from row 3)
 MISSING_VALUE_START_ROW = 3
-MISSING_VALUE_SOURCE_LABELS: dict[SourceKey, str] = {
-    "alphaspread": "Alpha Spread",
-    "valueinvesting": "ValueIo",
-    "gurufocus": "GuruFocus",
-    "price_target_low": "Price Target Low",
-    "price_target_avg": "Price Target Average",
-    "price_target_high": "Price Target High",
-}
-# Each source block has its own index/ticker columns and value column on Missing Value.
 MISSING_VALUE_BLOCKS: tuple[SheetColumnBlock, ...] = (
     SheetColumnBlock("alphaspread", "B", "C", "D", "Alpha Spread"),
     SheetColumnBlock("valueinvesting", "G", "H", "I", "ValueIo"),
@@ -121,29 +72,13 @@ MISSING_VALUE_BLOCKS: tuple[SheetColumnBlock, ...] = (
     SheetColumnBlock("price_target_high", "R", "S", "V", "Price Target High"),
 )
 
-# --- Source URLs ---
-ALPHA_SPREAD_URL = (
-    "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case"
-)
+ALPHA_SPREAD_URL = "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case"
 VALUE_INVESTING_URL = "https://valueinvesting.io/{ticker}/valuation/dcf-growth-exit-5y"
-# GuruFocus DCF / Fair Value entry point (see scrapers/gurufocus.py)
 GURUFOCUS_DCF_URL = "https://www.gurufocus.com/stock/{ticker}/dcf"
-# DCF page is client-rendered; Fair Value can take 30–90s without login
-GURUFOCUS_FAIR_VALUE_POLL_ATTEMPTS = 45
-GURUFOCUS_FAIR_VALUE_POLL_INTERVAL_MS = 2000
-GURUFOCUS_PAGE_SETTLE_MS = 5000
-GURUFOCUS_WAIT_FAIR_VALUE_TIMEOUT_MS = 90_000
-GURUFOCUS_CAPTURE_POST_LOAD_MS = 12_000
-# Optional: path to Playwright storage_state JSON after manual GuruFocus login
-GURUFOCUS_STORAGE_STATE = _PACKAGE_DIR / "gurufocus_auth.json"
 
-# --- Extraction (JSON keys + regex); see docs/FLOW.md ---
-# Substrings to prefer when filtering network JSON (empty = capture all JSON responses)
 JSON_URL_HINTS_ALPHASPREAD = ("alphaspread", "dcf", "valuation")
 JSON_URL_HINTS_VALUEINVESTING = ("valueinvesting", "valuation", "dcf", "fair")
-JSON_URL_HINTS_GURUFOCUS = ("gurufocus", "dcf", "stock", "api")
 
-# Keys searched in captured JSON trees (case-insensitive, underscores ignored)
 DCF_JSON_KEY_HINTS: tuple[str, ...] = (
     "dcf",
     "dcfvalue",
@@ -187,16 +122,4 @@ PRICE_TARGET_TEXT_REGEX: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Save HTML + JSON under logs/captures/ when extraction fails
-SAVE_DEBUG_ON_FAILURE = True
-DEBUG_CAPTURES_DIR = _PACKAGE_DIR / "logs" / "captures"
-
-# JSON-only testing (scripts/capture_json.py) — no Google Sheets required
-CAPTURE_TEST_OUTPUT_DIR = _PACKAGE_DIR / "logs" / "capture-test"
 DEFAULT_SECURITY_TYPE = "nasdaq"
-PRICE_TARGET_URL_TEMPLATE = "https://finance.yahoo.com/quote/{ticker}/analysis/"
-
-# Playwright settings for capture-json test script
-CAPTURE_TEST_WAIT_UNTIL = "domcontentloaded"
-CAPTURE_TEST_TIMEOUT_MS = 120_000
-CAPTURE_TEST_POST_LOAD_WAIT_MS = 3000

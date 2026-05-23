@@ -1,44 +1,10 @@
-"""
-Parse captured JSON / page text / CSS fallbacks into normalized sheet values.
-"""
-
 from __future__ import annotations
 
-import logging
 import re
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
-
-from playwright.sync_api import Page
-
-from config import (
-    DCF_JSON_KEY_HINTS,
-    DCF_TEXT_REGEX_PATTERNS,
-    PRICE_TARGET_JSON_KEY_HINTS,
-    PRICE_TARGET_TEXT_REGEX,
-    SAVE_DEBUG_ON_FAILURE,
-)
-from scrapers.capture import NetworkCapture, PageCapture, save_debug_capture
-
-logger = logging.getLogger(__name__)
-
-# Max depth when walking arbitrary JSON trees
-_JSON_WALK_MAX_DEPTH = 14
-
-
-@dataclass(frozen=True)
-class ExtractionResult:
-    """Outcome of the extraction pipeline."""
-
-    value: str
-    method: str  # json | regex_text | css | none
+from typing import Any, Optional, Sequence
 
 
 def normalize_numeric_string(raw: str) -> Optional[str]:
-    """
-    Turn '$1,234.56', '(12.3)', etc. into a sheet-friendly number string.
-    Returns None if not a valid number.
-    """
     if raw is None:
         return None
     text = str(raw).strip()
@@ -60,14 +26,12 @@ def normalize_numeric_string(raw: str) -> Optional[str]:
     if negative:
         number = -abs(number)
 
-    # Sheet: keep 2 decimals for fractional prices, else plain
     if abs(number - round(number)) < 1e-9:
         return str(int(round(number)))
     return f"{number:.2f}"
 
 
 def format_for_sheet(value: str) -> str:
-    """Final formatting before update_cell."""
     normalized = normalize_numeric_string(value)
     return normalized if normalized is not None else value.strip()
 
@@ -78,14 +42,18 @@ def _key_matches(key: str, hints: Sequence[str]) -> bool:
 
 
 def _coerce_number(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return normalize_numeric_string(str(value))
     if isinstance(value, str):
         return normalize_numeric_string(value)
+    if isinstance(value, dict):
+        for candidate_key in ("raw", "fmt", "value"):
+            if candidate_key in value:
+                coerced = _coerce_number(value[candidate_key])
+                if coerced is not None:
+                    return coerced
     return None
 
 
@@ -95,8 +63,7 @@ def walk_json_for_value(
     *,
     depth: int = 0,
 ) -> Optional[str]:
-    """Depth-first search for numeric values under keys matching hints."""
-    if depth > _JSON_WALK_MAX_DEPTH:
+    if depth > 14:
         return None
 
     if isinstance(obj, dict):
@@ -113,7 +80,7 @@ def walk_json_for_value(
             if nested is not None:
                 return nested
 
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         for item in obj:
             nested = walk_json_for_value(item, key_hints, depth=depth + 1)
             if nested is not None:
@@ -145,99 +112,3 @@ def extract_from_text(text: str, patterns: Sequence[str]) -> Optional[str]:
             if normalized is not None:
                 return normalized
     return None
-
-
-def run_extraction_pipeline(
-    page: Page,
-    url: str,
-    *,
-    source_key: str,
-    ticker: str,
-    source_label: str,
-    wait_until: str = "domcontentloaded",
-    timeout_ms: int = 90_000,
-    json_url_substrings: Sequence[str] = (),
-    json_key_hints: Sequence[str] = DCF_JSON_KEY_HINTS,
-    text_patterns: Sequence[str] = DCF_TEXT_REGEX_PATTERNS,
-    css_fallback: Optional[Callable[[Page], Optional[str]]] = None,
-    after_load: Optional[Callable[[Page], None]] = None,
-    debug_dir: Optional[Any] = None,
-) -> Optional[ExtractionResult]:
-    """
-    1. Navigate with NetworkCapture (JSON).
-    2. Parse JSON by key hints.
-    3. Regex on visible body text.
-    4. Optional CSS callback.
-    """
-    # Capture all JSON responses on the page (see scrapers/capture.py)
-    capture_handler = NetworkCapture(page)
-    if json_url_substrings:
-        logger.debug(
-            "[%s] URL hints (for reference): %s",
-            source_label,
-            ", ".join(json_url_substrings),
-        )
-
-    def navigate() -> None:
-        page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-        if after_load:
-            after_load(page)
-
-    capture: PageCapture = capture_handler.collect_during(navigate)
-
-    # --- 1. JSON ---
-    json_value = extract_from_json_payloads(capture.json_payloads, json_key_hints)
-    if json_value is not None:
-        logger.info("[%s] %s extracted via JSON (%d payloads)", source_label, ticker, len(capture.json_payloads))
-        return ExtractionResult(value=json_value, method="json")
-
-    # --- 2. Regex on visible text ---
-    try:
-        body_text = page.locator("body").inner_text(timeout=20_000)
-    except Exception:
-        body_text = capture.html or ""
-
-    text_value = extract_from_text(body_text, text_patterns)
-    if text_value is not None:
-        logger.info("[%s] %s extracted via regex on page text", source_label, ticker)
-        return ExtractionResult(value=text_value, method="regex_text")
-
-    # --- 3. CSS fallback ---
-    if css_fallback:
-        css_raw = css_fallback(page)
-        if css_raw is not None:
-            normalized = normalize_numeric_string(css_raw)
-            if normalized is not None:
-                logger.info("[%s] %s extracted via CSS fallback", source_label, ticker)
-                return ExtractionResult(value=normalized, method="css")
-
-    if SAVE_DEBUG_ON_FAILURE and debug_dir is not None:
-        save_debug_capture(capture, debug_dir, source=source_key, ticker=ticker)
-
-    logger.warning("[%s] %s: no value (json=%d)", source_label, ticker, len(capture.json_payloads))
-    return None
-
-
-def run_price_target_pipeline(
-    page: Page,
-    url: str,
-    *,
-    source_key: str,
-    ticker: str,
-    source_label: str,
-    kind: str,
-    **kwargs: Any,
-) -> Optional[ExtractionResult]:
-    """Price targets use alternate JSON keys and regex patterns per kind."""
-    hints = PRICE_TARGET_JSON_KEY_HINTS.get(kind, PRICE_TARGET_JSON_KEY_HINTS["avg"])
-    patterns = PRICE_TARGET_TEXT_REGEX.get(kind, PRICE_TARGET_TEXT_REGEX["avg"])
-    return run_extraction_pipeline(
-        page,
-        url,
-        source_key=source_key,
-        ticker=ticker,
-        source_label=source_label,
-        json_key_hints=hints,
-        text_patterns=patterns,
-        **kwargs,
-    )
