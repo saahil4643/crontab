@@ -3,17 +3,18 @@
 ## Runtime Flow
 
 1. Process sheet jobs sequentially.
-2. Launch a fresh Chromium browser and isolated context per job.
-3. Use `RESILIENT_FORWARD_PROXY` or `PLAYWRIGHT_PROXY` when configured; otherwise run direct.
-4. Apply Playwright stealth to the page when available.
-5. Try the primary source URL with a 10 second timeout.
-6. If the primary source fails, navigate directly to Google SERP with `hl=en`.
-7. Extract search snippets only and do not click result links.
-8. Pass snippets to Groq for strict numeric parsing.
-9. Try Groq keys sequentially as failover.
-10. Write successful values back with retry/backoff.
-11. Close page, browser context, and browser for every job.
-12. Sleep for 6 seconds after each job by default.
+2. Auto-wrap the run in `xvfb-run` when no display is available.
+3. Launch a fresh headed Chromium browser and isolated context per job by default.
+4. Use `RESILIENT_FORWARD_PROXY` or `PLAYWRIGHT_PROXY` when configured; otherwise run direct.
+5. Apply Playwright stealth to the page when available.
+6. Try the primary source URL with a 10 second timeout.
+7. If the primary source fails, navigate directly to Google SERP with `hl=en`.
+8. Extract search snippets only and do not click result links.
+9. Pass snippets to Groq for numeric parsing or lenient estimation.
+10. Try Groq keys sequentially as failover.
+11. Write successful values back with retry/backoff.
+12. Close page, browser context, and browser for every job.
+13. Sleep for 6 seconds after each job by default.
 
 ## Modules
 
@@ -59,6 +60,14 @@ Set to `forward` by default. Use `direct` to disable browser proxy routing.
 
 Forward proxy URL used by browser contexts. Falls back to `PLAYWRIGHT_PROXY`.
 
+`RESILIENT_USE_XVFB`
+
+Auto-wrap with `xvfb-run` when no display is available. Default: `1`.
+
+`RESILIENT_HEADLESS`
+
+Launch Chromium headless when `1`; headed when `0`. Default: `0`.
+
 `DIRECT_SCRAPE_TIMEOUT_MS`
 
 Primary source navigation timeout. Default: `10000`.
@@ -98,6 +107,10 @@ Groq OpenAI-compatible chat completions endpoint. Default: `https://api.groq.com
 `GROQ_TIMEOUT_SECONDS`
 
 Groq request timeout. Default: `25`.
+
+`GROQ_LENIENT_FALLBACK`
+
+Allow Groq to estimate when snippets are missing or incomplete. Default: `1`.
 
 ## Run
 
@@ -145,6 +158,6 @@ kill $(cat logs/resilient_sheet_run.pid)
 
 ## Production Notes
 
-Groq is used only after the primary path and Google snippet collection. It is instructed to use only snippets and return an empty response if the metric is not explicitly present.
+Groq is used after the primary path and Google snippet collection. By default it is lenient and can estimate when snippets are missing or incomplete; set `GROQ_LENIENT_FALLBACK=0` to require snippet-only extraction.
 
-Sheet mode processes `alphaspread`, `valueinvesting`, `gurufocus`, `price_target_low`, `price_target_avg`, and `price_target_high`. Failed jobs are left unchanged unless `--write-failures` is passed.
+Sheet mode processes `alphaspread`, `valueinvesting`, `gurufocus`, `price_target_low`, `price_target_avg`, and `price_target_high`. Failed jobs are left unchanged so unavailable values do not write `N/A`.

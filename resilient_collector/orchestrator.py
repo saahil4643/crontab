@@ -42,6 +42,17 @@ SHEET_SOURCES: set[SourceKey] = {
 }
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def browser_headless() -> bool:
+    return env_bool("RESILIENT_HEADLESS", False)
+
+
 @dataclass
 class TickerResult:
     ticker: str
@@ -153,7 +164,7 @@ async def process_ticker(ticker: str, proxy_pool: list[ProxyConfig]) -> TickerRe
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.chromium.launch(headless=browser_headless())
             context = await create_isolated_context(browser, proxy)
             page = await context.new_page()
             await apply_stealth(page)
@@ -241,7 +252,7 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.chromium.launch(headless=browser_headless())
             context = await create_isolated_context(browser, proxy)
             page = await context.new_page()
             await apply_stealth(page)
@@ -364,7 +375,6 @@ async def run_sheet_collector(
     dry_run: bool = False,
     limit: int | None = None,
     sources: set[SourceKey] | None = None,
-    write_failures: bool = False,
 ) -> list[SheetJobResult]:
     load_env_file()
     client = DcfSheetClient()
@@ -422,16 +432,6 @@ async def run_sheet_collector(
                 job.ticker,
                 value,
                 result.source,
-            )
-        elif write_failures:
-            await retry_sync("write_value", client.write_value, job, "N/A")
-            written = True
-            logger.warning(
-                "[sheet] Wrote N/A row=%d col=%s ticker=%s error=%s",
-                job.row,
-                job.value_col,
-                job.ticker,
-                result.error,
             )
         else:
             logger.warning(
@@ -505,11 +505,6 @@ def main() -> None:
         metavar="SOURCE",
         help="Sheet source to process; repeatable",
     )
-    parser.add_argument(
-        "--write-failures",
-        action="store_true",
-        help="Write N/A on failed sheet jobs instead of leaving cells unchanged",
-    )
     args = parser.parse_args()
 
     if args.sheet:
@@ -523,7 +518,6 @@ def main() -> None:
                 dry_run=args.dry_run,
                 limit=args.limit,
                 sources=sources,
-                write_failures=args.write_failures,
             )
         )
         logger.info("=== Sheet Summary ===")

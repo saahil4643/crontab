@@ -18,6 +18,7 @@ GROQ_ENDPOINT = os.environ.get(
 )
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_TIMEOUT_SECONDS = float(os.environ.get("GROQ_TIMEOUT_SECONDS", "25"))
+GROQ_LENIENT_FALLBACK = os.environ.get("GROQ_LENIENT_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -84,6 +85,15 @@ def _build_prompt(
 ) -> str:
     snippet_text = "\n".join(f"- {snippet[:700]}" for snippet in (snippets or [])[:10])
     target = metric_label or "GuruFocus DCF Fair Value or intrinsic value per share"
+    if GROQ_LENIENT_FALLBACK:
+        source_text = snippet_text or "No useful search snippets were available."
+        return (
+            f"Find the best available numeric estimate for the {target} for ticker {ticker}.\n"
+            "Prefer the provided snippets when they contain the value. If snippets are missing or incomplete, "
+            "use your best financial knowledge or reasonable estimate.\n"
+            "Return only one numeric value with no currency symbol, no JSON, no words, and no explanation.\n"
+            f"Snippets:\n{source_text}"
+        )
     return (
         f"Extract the {target} for ticker {ticker} only from the snippets below.\n"
         "Return only the numeric value with no currency symbol, no JSON, no words, and no explanation.\n"
@@ -127,7 +137,7 @@ async def extract_groq_fallback_metric(
     snippets: list[str] | None = None,
     metric_label: str | None = None,
 ) -> GroqFallbackResult:
-    if not snippets:
+    if not snippets and not GROQ_LENIENT_FALLBACK:
         logger.warning("[%s] Groq fallback skipped: no search snippets to parse", ticker)
         return GroqFallbackResult(metric=None, note="No search snippets to parse")
 
@@ -142,7 +152,10 @@ async def extract_groq_fallback_metric(
         "messages": [
             {
                 "role": "system",
-                "content": "You are a strict extraction engine. Use only the provided snippets. Return only a number or an empty response.",
+                "content": (
+                    "You return only one numeric financial metric value. "
+                    "No prose, no JSON, no currency symbol, no explanation."
+                ),
             },
             {
                 "role": "user",

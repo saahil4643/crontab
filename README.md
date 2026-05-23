@@ -11,6 +11,7 @@ python run_resilient_sheet.py
 ```bash
 pip install -r requirements.txt
 playwright install chromium
+sudo apt install xvfb
 ```
 
 Place Google credentials at:
@@ -25,6 +26,9 @@ Add Groq keys and optional proxy settings to `.env`:
 GROQ_KEY_1=your_first_key
 GROQ_KEY_2=your_second_key
 RESILIENT_FORWARD_PROXY=http://127.0.0.1:10809
+RESILIENT_USE_XVFB=1
+RESILIENT_HEADLESS=0
+GROQ_LENIENT_FALLBACK=1
 ```
 
 ## Run
@@ -46,6 +50,8 @@ Background run:
 ```bash
 python run_resilient_sheet.py --background
 ```
+
+The runner automatically uses `xvfb-run` when no display is available. Use `--no-xvfb` only if you intentionally want no virtual display.
 
 Watch logs:
 
