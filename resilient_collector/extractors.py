@@ -15,14 +15,14 @@ from config import (
     ALPHA_SPREAD_URL,
     DCF_JSON_KEY_HINTS,
     DCF_TEXT_REGEX_PATTERNS,
-    GURUFOCUS_DCF_URL,
+    GURUFOCUS_EARNINGS_TERM_URL,
     JSON_URL_HINTS_ALPHASPREAD,
-    JSON_URL_HINTS_VALUEINVESTING,
     PRICE_TARGET_JSON_KEY_HINTS,
     PRICE_TARGET_TEXT_REGEX,
     SourceKey,
     USER_AGENT,
-    VALUE_INVESTING_URL,
+    VALUE_INVESTING_PATHS,
+    VALUE_INVESTING_VALUATION_URL,
 )
 from models import ScrapeJob
 from scrapers.extract import extract_from_json_payloads, extract_from_text, normalize_numeric_string
@@ -30,6 +30,16 @@ from scrapers.extract import extract_from_json_payloads, extract_from_text, norm
 logger = logging.getLogger(__name__)
 DIRECT_TIMEOUT_MS = int(os.environ.get("DIRECT_SCRAPE_TIMEOUT_MS", "10000"))
 SERP_TIMEOUT_MS = int(os.environ.get("SERP_TIMEOUT_MS", "10000"))
+VALUEINVESTING_CARD_WAIT_MS = int(os.environ.get("VALUEINVESTING_CARD_WAIT_MS", "12000"))
+
+_FAIR_PRICE_LABELS = ("fair price", "fair value")
+_VALUEINVESTING_BLOCKED_MARKERS = (
+    "regional plan",
+    "global plan",
+    "start free trial",
+    "create your account",
+)
+_VALUEINVESTING_PLAN_PRICE = "14.99"
 
 
 @dataclass
@@ -44,34 +54,24 @@ class PrimaryExtractionResult:
     method: str
 
 
-_EXTRACT_FAIR_VALUE_JS = """
-() => {
-  const parseDollar = (text) => {
-    if (!text) return null;
-    const m = String(text).match(/\\$\\s*(-?[\\d]{1,3}(?:,[\\d]{3})*(?:\\.[\\d]+)?|-?[\\d]+(?:\\.[\\d]+)?)/);
-    return m ? m[1].replace(/,/g, '') : null;
-  };
-
-  const tables = Array.from(document.querySelectorAll('.stock-dcf-table'));
-  for (const table of tables) {
-    const rows = table.querySelectorAll('.dcf-table-row, .el-row.dcf-table-row, .el-row');
-    for (const row of rows) {
-      const label = (row.innerText || '').trim();
-      if (!/Fair Value/i.test(label) || /Saved Fair Values/i.test(label)) continue;
-      const valueCell = row.querySelector(
-        '.fs-x-large.fw-bolder.text-right.el-col-12, .fs-x-large.fw-bolder.text-right'
-      );
-      if (!valueCell) continue;
-      const val = parseDollar(valueCell.innerText || valueCell.textContent);
-      if (val && parseFloat(val) > 0) return val;
-    }
-  }
-  return null;
-}
-"""
-
 _DOLLAR_RE = re.compile(
     r"\$\s*(-?[\d]{1,3}(?:,[\d]{3})*(?:\.\d+)?|-?[\d]+(?:\.\d+)?)"
+)
+
+_GURUFOCUS_EARNINGS_LABEL = "Intrinsic Value: DCF (Earnings Based)"
+_GURUFOCUS_EARNINGS_PATTERNS = (
+    re.compile(
+        r"Intrinsic\s+Value\s*:\s*DCF\s*\(\s*Earnings\s+Based\s*\)\s*:\s*\$?\s*(-?[\d,]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"Intrinsic\s+Value\s*:\s*DCF\s*\(\s*Earnings\s+Based\s*\)\s+is\s+\$?\s*(-?[\d,]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"intrinsic\s+value\s+calculated\s+from\s+the\s+Discounted\s+Earnings\s+model\s+is\s+\$?\s*(-?[\d,]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
 )
 
 _SNIPPET_METRIC_PATTERNS = (
@@ -89,10 +89,29 @@ _SNIPPET_METRIC_PATTERNS = (
     ),
 )
 
+_GOOGLE_SNIPPET_SELECTORS = (
+    "#search > div",
+    "div.VwiC3b",
+    "span.hgKElc",
+    "div[data-sncf]",
+    "div[data-content-feature='1']",
+    "div.IsZvec",
+    "div.kb0PBd",
+    "div.g",
+    "#search",
+)
+
+_GOOGLE_BLOCKED_MARKERS = (
+    "our systems have detected unusual traffic",
+    "sorry, but your computer or network may be sending automated queries",
+    "before you continue to google search",
+    "captcha",
+)
+
 _SOURCE_LABELS: dict[SourceKey, str] = {
     "alphaspread": "Alpha Spread DCF fair value",
     "valueinvesting": "ValueInvesting DCF fair value",
-    "gurufocus": "GuruFocus DCF fair value",
+    "gurufocus": "GuruFocus intrinsic value DCF earnings based",
     "price_target_low": "Yahoo Finance analyst low price target",
     "price_target_avg": "Yahoo Finance analyst average price target",
     "price_target_high": "Yahoo Finance analyst high price target",
@@ -103,16 +122,6 @@ _PRICE_TARGET_KIND: dict[SourceKey, str] = {
     "price_target_avg": "avg",
     "price_target_high": "high",
 }
-
-_VALUEINVESTING_JSON_HINTS = (
-    "dcfvaluation",
-    "dcfvalue",
-    "fairvalue",
-    "fairprice",
-    "intrinsicvalue",
-    "estimatedvalue",
-    "valuepershare",
-)
 
 _VALUEINVESTING_TEXT_PATTERNS = (
     r"Discounted\s+Cash\s+Flow\s*\(DCF\)\s+valuation\b.*?\bis\s+(-?[\d,.]+)\s+USD\b",
@@ -152,7 +161,7 @@ def _google_query(job: ScrapeJob) -> str:
     if job.source == "valueinvesting":
         return f"{job.ticker} valueinvesting.io dcf valuation"
     if job.source == "gurufocus":
-        return f"{job.ticker} dcf gurufocus"
+        return f"DCF earnings based {job.ticker} guru focus"
     if job.source == "price_target_low":
         return f"{job.ticker} analyst price target low yahoo finance"
     if job.source == "price_target_avg":
@@ -163,6 +172,8 @@ def _google_query(job: ScrapeJob) -> str:
 
 
 def _patterns_for_source(source: SourceKey) -> tuple[re.Pattern[str], ...]:
+    if source == "gurufocus":
+        return _GURUFOCUS_EARNINGS_PATTERNS
     if source == "price_target_low":
         return (
             re.compile(r"(?:low|lowest)[^\n\r$]{0,80}\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)", re.I),
@@ -189,7 +200,42 @@ def extract_metric_from_snippet_for_source(text: str, source: SourceKey) -> str 
             value = normalize_numeric_string(match.group(1))
             if value:
                 return value
+    if source == "gurufocus":
+        return None
     return extract_metric_from_snippet(text)
+
+
+def _dedupe_texts(texts: list[str], *, max_items: int = 20) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for text in texts:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+async def _collect_google_snippets(page: Page) -> list[str]:
+    snippets: list[str] = []
+    for selector in _GOOGLE_SNIPPET_SELECTORS:
+        try:
+            texts = await page.locator(selector).all_text_contents()
+            snippets.extend(t.strip() for t in texts if t.strip())
+        except Exception:
+            continue
+    return _dedupe_texts(snippets)
+
+
+def _extract_google_metric(snippets: list[str], source: SourceKey) -> str | None:
+    for snippet in snippets:
+        value = extract_metric_from_snippet_for_source(snippet, source)
+        if value:
+            return value
+    return None
 
 
 async def _capture_response_json(response: Any, hints: tuple[str, ...], payloads: list[Any]) -> None:
@@ -287,76 +333,193 @@ async def _extract_alpha_spread(page: Page, job: ScrapeJob) -> PrimaryExtraction
     raise RuntimeError("Alpha Spread metric not found")
 
 
-async def _extract_valueinvesting(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
-    url = VALUE_INVESTING_URL.format(ticker=job.ticker)
-    logger.info("[%s] ValueInvesting primary navigation: %s", job.ticker, url)
-    payloads, text = await _navigate_collect(
-        page,
-        url,
-        job.ticker,
-        "ValueInvesting",
-        hints=JSON_URL_HINTS_VALUEINVESTING,
-        timeout=DIRECT_TIMEOUT_MS,
-    )
-    lowered = text.lower()
-    if "discounted cash flow" not in lowered and "dcf valuation" not in lowered:
-        blocked_markers = ("regional plan", "global plan", "start free trial", "create your account")
-        if any(marker in lowered for marker in blocked_markers):
-            raise RuntimeError("ValueInvesting pricing/login page")
-    json_value = extract_from_json_payloads(payloads, _VALUEINVESTING_JSON_HINTS)
-    if json_value and json_value != "14.99":
-        return PrimaryExtractionResult(metric=json_value, method="json")
+def _label_matches_fair_price(label: str) -> bool:
+    lowered = label.strip().lower()
+    return any(marker in lowered for marker in _FAIR_PRICE_LABELS)
+
+
+def _valid_valueinvesting_metric(value: str | None) -> str | None:
+    if not value or value == _VALUEINVESTING_PLAN_PRICE:
+        return None
+    return value
+
+
+async def _valueinvesting_metric_from_norm(locator) -> str | None:
+    if await locator.count() == 0:
+        return None
+    raw = await locator.inner_text(timeout=5000)
+    return _valid_valueinvesting_metric(normalize_numeric_string(raw))
+
+
+async def _valueinvesting_extract_fair_price_cards(page: Page, ticker: str) -> tuple[str, str] | None:
+    card_locator = page.locator(".price_square").first
     try:
-        norm_texts = [
-            (await el.text_content(timeout=3000) or "").strip()
-            for el in await page.locator(".norm").all()
-        ]
-        for index in (2, 1, 0):
-            if len(norm_texts) > index and "%" not in norm_texts[index]:
-                value = normalize_numeric_string(norm_texts[index].split()[0])
-                if value and value != "14.99":
-                    return PrimaryExtractionResult(metric=value, method="norm")
+        await card_locator.wait_for(state="visible", timeout=VALUEINVESTING_CARD_WAIT_MS)
     except Exception:
-        pass
-    text_value = extract_from_text(text, _VALUEINVESTING_TEXT_PATTERNS)
-    if text_value:
-        return PrimaryExtractionResult(metric=text_value, method="text")
-    raise RuntimeError("ValueInvesting metric not found")
+        logger.debug("[%s] ValueInvesting .price_square not visible within timeout", ticker)
+        return None
 
+    labels = page.locator(".tiny")
+    label_count = await labels.count()
+    for index in range(label_count):
+        label_text = (await labels.nth(index).inner_text(timeout=3000) or "").strip()
+        if not _label_matches_fair_price(label_text):
+            continue
+        norm = labels.nth(index).locator("xpath=..").locator(".norm").first
+        value = await _valueinvesting_metric_from_norm(norm)
+        if value:
+            logger.info("[%s] ValueInvesting fair value via card label %r -> %s", ticker, label_text, value)
+            return value, "card_label"
 
-async def _extract_fair_value_dom(page: Page) -> str | None:
-    try:
-        raw = await page.evaluate(_EXTRACT_FAIR_VALUE_JS)
-        if raw:
-            return normalize_numeric_string(str(raw))
-    except Exception as exc:
-        logger.debug("GuruFocus JS extract failed: %s", exc)
+    squares = page.locator(".price_square")
+    square_count = await squares.count()
+    for index in range(square_count):
+        square = squares.nth(index)
+        square_text = (await square.inner_text(timeout=3000) or "").strip()
+        if not _label_matches_fair_price(square_text):
+            continue
+        value = await _valueinvesting_metric_from_norm(square.locator(".norm").first)
+        if value:
+            logger.info("[%s] ValueInvesting fair value via price_square -> %s", ticker, value)
+            return value, "card_square"
 
-    try:
-        panel = page.locator(
-            ".el-col.inline.p-l-xs .stock-dcf-table, "
-            ".inline.p-l-xs .stock-dcf-table"
-        ).first
-        if await panel.count() > 0:
-            row = panel.locator(".dcf-table-row").filter(has_text="Fair Value").first
-            if await row.count() > 0:
-                cell = row.locator(".fs-x-large.fw-bolder.text-right").first
-                if await cell.count() > 0:
-                    text = await cell.inner_text(timeout=5000)
-                    match = _DOLLAR_RE.search(text)
-                    if match:
-                        return normalize_numeric_string(match.group(1))
-    except Exception as exc:
-        logger.debug("GuruFocus locator extract failed: %s", exc)
+    fair_row = page.locator(
+        'xpath=//tr[td[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", '
+        '"abcdefghijklmnopqrstuvwxyz"), "fair price")]]'
+    ).first
+    if await fair_row.count() > 0:
+        cells = fair_row.locator("td")
+        cell_count = await cells.count()
+        if cell_count >= 3:
+            cell_text = await cells.nth(2).inner_text(timeout=3000)
+            value = _valid_valueinvesting_metric(normalize_numeric_string(cell_text))
+            if value:
+                logger.info("[%s] ValueInvesting fair value via table row -> %s", ticker, value)
+                return value, "table_row"
 
     return None
 
 
+async def _valueinvesting_page_blocked(page: Page) -> bool:
+    try:
+        body = (await page.locator("body").inner_text(timeout=8000)).lower()
+    except Exception:
+        return False
+    if "discounted cash flow" in body or "dcf valuation" in body:
+        return False
+    return any(marker in body for marker in _VALUEINVESTING_BLOCKED_MARKERS)
+
+
+async def _extract_valueinvesting(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+    ticker = job.ticker.strip().upper()
+    last_error: Exception | None = None
+
+    for path in VALUE_INVESTING_PATHS:
+        url = VALUE_INVESTING_VALUATION_URL.format(ticker=ticker, path=path)
+        logger.info("[%s] ValueInvesting primary navigation: %s", ticker, url)
+        try:
+            await page.set_extra_http_headers({
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": USER_AGENT,
+            })
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=DIRECT_TIMEOUT_MS)
+            if response is None:
+                raise RuntimeError("ValueInvesting returned no response")
+            status = response.status
+            logger.info("[%s] ValueInvesting status=%s path=%s", ticker, status, path)
+            if status in {403, 429} or status >= 500:
+                raise RuntimeError(f"ValueInvesting restrictive or unstable status: {status}")
+
+            await _dismiss_overlays(page)
+            if await _valueinvesting_page_blocked(page):
+                raise RuntimeError("ValueInvesting pricing/login page")
+
+            extracted = await _valueinvesting_extract_fair_price_cards(page, ticker)
+            if extracted:
+                metric, method = extracted
+                return PrimaryExtractionResult(metric=metric, method=method)
+
+            try:
+                text = await page.locator("body").inner_text(timeout=10_000)
+            except Exception:
+                text = await page.content()
+            text_value = extract_from_text(text, _VALUEINVESTING_TEXT_PATTERNS)
+            if text_value and text_value != _VALUEINVESTING_PLAN_PRICE:
+                logger.info("[%s] ValueInvesting fair value via text regex -> %s", ticker, text_value)
+                return PrimaryExtractionResult(metric=text_value, method="text")
+        except Exception as exc:
+            last_error = exc
+            logger.warning("[%s] ValueInvesting path %s failed: %s", ticker, path, exc)
+            continue
+
+    detail = str(last_error) if last_error else "Fair Price metric not found on any valuation page"
+    raise RuntimeError(f"ValueInvesting metric not found ({detail})")
+
+
+def _extract_gurufocus_earnings_value(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return None
+    for pattern in _GURUFOCUS_EARNINGS_PATTERNS:
+        match = pattern.search(normalized)
+        if not match:
+            continue
+        value = normalize_numeric_string(match.group(1))
+        if value:
+            return value
+    return None
+
+
+async def _extract_gurufocus_earnings_term(page: Page, ticker: str) -> PrimaryExtractionResult | None:
+    container = page.locator("#def_body_detail_height").first
+    try:
+        await container.wait_for(state="attached", timeout=15_000)
+    except Exception as exc:
+        logger.debug("[%s] GuruFocus earnings term container not visible: %s", ticker, exc)
+
+    try:
+        heading = container.locator("h1").first
+        if await heading.count() > 0:
+            heading_text = await heading.inner_text(timeout=5000)
+            value = _extract_gurufocus_earnings_value(heading_text)
+            if value:
+                logger.info("[%s] GuruFocus earnings DCF via term h1 -> %s", ticker, value)
+                return PrimaryExtractionResult(metric=value, method="term_h1")
+
+            if _GURUFOCUS_EARNINGS_LABEL.lower() in heading_text.lower():
+                spans = heading.locator("span")
+                for index in range(await spans.count()):
+                    span_text = await spans.nth(index).inner_text(timeout=3000)
+                    match = _DOLLAR_RE.search(span_text)
+                    if match:
+                        value = normalize_numeric_string(match.group(1))
+                        if value:
+                            logger.info("[%s] GuruFocus earnings DCF via term h1 span -> %s", ticker, value)
+                            return PrimaryExtractionResult(metric=value, method="term_h1_span")
+    except Exception as exc:
+        logger.debug("[%s] GuruFocus earnings heading extract failed: %s", ticker, exc)
+
+    try:
+        body_text = await container.inner_text(timeout=8000)
+    except Exception:
+        body_text = await page.locator("body").inner_text(timeout=8000)
+
+    value = _extract_gurufocus_earnings_value(body_text)
+    if value:
+        logger.info("[%s] GuruFocus earnings DCF via term text -> %s", ticker, value)
+        return PrimaryExtractionResult(metric=value, method="term_text")
+    return None
+
+
 async def _extract_gurufocus(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
-    ticker = job.ticker
-    url = GURUFOCUS_DCF_URL.format(ticker=ticker.strip().upper())
+    ticker = job.ticker.strip().upper()
+    url = GURUFOCUS_EARNINGS_TERM_URL.format(ticker=ticker)
     logger.info("[%s] GuruFocus primary navigation: %s", ticker, url)
 
+    await page.set_extra_http_headers({
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": USER_AGENT,
+    })
     response = await page.goto(
         url,
         wait_until="domcontentloaded",
@@ -370,27 +533,12 @@ async def _extract_gurufocus(page: Page, job: ScrapeJob) -> PrimaryExtractionRes
     if status in {403, 429} or status >= 500:
         raise RuntimeError(f"Restrictive or unstable status: {status}")
 
-    for label in ("Accept", "Accept All", "I agree", "Got it"):
-        try:
-            await page.get_by_role("button", name=label).click(timeout=2000)
-            break
-        except Exception:
-            continue
+    await _dismiss_overlays(page)
+    term_result = await _extract_gurufocus_earnings_term(page, ticker)
+    if term_result:
+        return term_result
 
-    try:
-        await page.wait_for_selector(".stock-dcf-table", state="visible", timeout=10_000)
-    except Exception as exc:
-        logger.warning("[%s] .stock-dcf-table not visible: %s", ticker, exc)
-
-    for attempt in range(1, 4):
-        value = await _extract_fair_value_dom(page)
-        if value:
-            logger.info("[%s] Primary Fair Value on poll %d: %s", ticker, attempt, value)
-            return PrimaryExtractionResult(metric=value, method="dom")
-        if attempt < 15:
-            await page.wait_for_timeout(2000)
-
-    raise RuntimeError("Primary page loaded but Fair Value metric was not found")
+    raise RuntimeError("GuruFocus earnings-based DCF metric was not found")
 
 
 def _price_targets_from_text(text: str) -> dict[str, str]:
@@ -501,20 +649,34 @@ async def extract_google_fallback_metric_for_job(page: Page, job: ScrapeJob) -> 
     query = _google_query(job)
     logger.info("[%s] Fallback: Google search %r", job.ticker, query)
     search_url = f"https://www.google.com/search?q={quote_plus(query)}&hl=en"
+    await page.set_extra_http_headers({
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": USER_AGENT,
+    })
     await page.goto(search_url, wait_until="domcontentloaded", timeout=SERP_TIMEOUT_MS)
-    await page.wait_for_load_state("domcontentloaded", timeout=SERP_TIMEOUT_MS)
+    try:
+        await _dismiss_overlays(page)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=SERP_TIMEOUT_MS)
+    except Exception:
+        pass
+    await page.wait_for_timeout(1500)
 
-    selectors = ("div.VwiC3b", "span.hgKElc", "div[data-sncf]", "div[data-content-feature='1']")
-    snippets: list[str] = []
-    for selector in selectors:
-        try:
-            texts = await page.locator(selector).all_text_contents()
-            snippets.extend(t.strip() for t in texts if t.strip())
-        except Exception:
-            continue
+    snippets = await _collect_google_snippets(page)
+    try:
+        body_text = (await page.locator("body").inner_text(timeout=5000)).lower()
+        if any(marker in body_text for marker in _GOOGLE_BLOCKED_MARKERS):
+            logger.warning("[%s] Google fallback appears blocked or challenged", job.ticker)
+    except Exception:
+        pass
 
     logger.info("[%s] Fallback collected %d search snippets", job.ticker, len(snippets))
-    return GoogleFallbackResult(metric=None, snippets=snippets)
+    metric = _extract_google_metric(snippets, job.source)
+    if metric:
+        logger.info("[%s] Google fallback extracted metric=%s", job.ticker, metric)
+    return GoogleFallbackResult(metric=metric, snippets=snippets)
 
 
 async def extract_google_fallback_metric(page: Page, ticker: str) -> GoogleFallbackResult:

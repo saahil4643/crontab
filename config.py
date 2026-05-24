@@ -74,7 +74,13 @@ MISSING_VALUE_BLOCKS: tuple[SheetColumnBlock, ...] = (
 
 ALPHA_SPREAD_URL = "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case"
 VALUE_INVESTING_URL = "https://valueinvesting.io/{ticker}/valuation/dcf-growth-exit-5y"
-GURUFOCUS_DCF_URL = "https://www.gurufocus.com/stock/{ticker}/dcf"
+VALUE_INVESTING_VALUATION_URL = "https://valueinvesting.io/{ticker}/valuation/{path}"
+VALUE_INVESTING_PATHS: tuple[str, ...] = (
+    "dcf-growth-exit-5y",
+    "dcf-ebitda-exit-5y",
+    "dcf",
+)
+GURUFOCUS_EARNINGS_TERM_URL = "https://www.gurufocus.com/term/intrinsic-value-dcf-earnings-based/{ticker}"
 
 JSON_URL_HINTS_ALPHASPREAD = ("alphaspread", "dcf", "valuation")
 JSON_URL_HINTS_VALUEINVESTING = ("valueinvesting", "valuation", "dcf", "fair")

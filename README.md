@@ -28,7 +28,6 @@ GROQ_KEY_2=your_second_key
 RESILIENT_FORWARD_PROXY=http://127.0.0.1:10809
 RESILIENT_USE_XVFB=1
 RESILIENT_HEADLESS=0
-GROQ_LENIENT_FALLBACK=1
 ```
 
 ## Run
@@ -75,3 +74,5 @@ The collector processes missing cells for:
 - Price Target Low
 - Price Target Average
 - Price Target High
+
+If a queued cell cannot be refreshed, its existing sheet value is left unchanged instead of writing `N/A`.

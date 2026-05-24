@@ -108,9 +108,10 @@ Groq OpenAI-compatible chat completions endpoint. Default: `https://api.groq.com
 
 Groq request timeout. Default: `25`.
 
-`GROQ_LENIENT_FALLBACK`
+Groq fallback order after primary and Google:
 
-Allow Groq to estimate when snippets are missing or incomplete. Default: `1`.
+1. Parse Google snippets only (no model memory).
+2. If still no value, optional direct Groq question (`RESILIENT_GROQ_DIRECT_FALLBACK=1`, default on). This may use model training data and can be stale; logs as `groq_direct_fallback`.
 
 ## Run
 
@@ -158,6 +159,6 @@ kill $(cat logs/resilient_sheet_run.pid)
 
 ## Production Notes
 
-Groq is used after the primary path and Google snippet collection. By default it is lenient and can estimate when snippets are missing or incomplete; set `GROQ_LENIENT_FALLBACK=0` to require snippet-only extraction.
+Groq is used after the primary path and Google snippet collection. Snippet parsing is evidence-only. If that still fails, direct Groq is a last-resort backup (may be stale). If all fallbacks fail, the value is left unchanged.
 
-Sheet mode processes `alphaspread`, `valueinvesting`, `gurufocus`, `price_target_low`, `price_target_avg`, and `price_target_high`. Failed jobs are left unchanged so unavailable values do not write `N/A`.
+Sheet mode processes `alphaspread`, `valueinvesting`, `gurufocus`, `price_target_low`, `price_target_avg`, and `price_target_high`. Failed queued jobs are left unchanged so unavailable values do not overwrite existing sheet data.

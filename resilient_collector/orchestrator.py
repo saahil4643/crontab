@@ -20,7 +20,11 @@ from resilient_collector.extractors import (
     source_metric_label,
 )
 from resilient_collector.env_loader import load_env_file
-from resilient_collector.groq_fallback import extract_groq_fallback_metric
+from resilient_collector.groq_fallback import (
+    extract_groq_direct_fallback_metric,
+    extract_groq_fallback_metric,
+    groq_direct_fallback_enabled,
+)
 from resilient_collector.proxy_pool import ProxyConfig, build_validated_pool
 from scrapers.extract import format_for_sheet
 from sheet_client import DcfSheetClient
@@ -28,6 +32,7 @@ from sheet_client import DcfSheetClient
 logger = logging.getLogger(__name__)
 
 BASELINE_SLEEP_SECONDS = int(os.environ.get("RESILIENT_SLEEP_BASELINE_SECONDS", "6"))
+GURUFOCUS_SLEEP_SECONDS = int(os.environ.get("RESILIENT_GURUFOCUS_SLEEP_SECONDS", "90"))
 JITTER_SECONDS = int(os.environ.get("RESILIENT_SLEEP_JITTER_SECONDS", "0"))
 SHEET_RETRY_ATTEMPTS = int(os.environ.get("SHEET_RETRY_ATTEMPTS", "6"))
 SHEET_RETRY_BASE_SECONDS = float(os.environ.get("SHEET_RETRY_BASE_SECONDS", "2"))
@@ -53,6 +58,67 @@ def browser_headless() -> bool:
     return env_bool("RESILIENT_HEADLESS", False)
 
 
+def groq_requires_snippets() -> bool:
+    raw = os.environ.get("RESILIENT_GROQ_REQUIRE_SNIPPETS")
+    if raw is None:
+        raw = os.environ.get("GROQ_REQUIRE_SNIPPETS")
+    if raw is None:
+        return True
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _run_groq_fallback_chain(
+    ticker: str,
+    snippets: list[str],
+    metric_label: str,
+) -> TickerResult | None:
+    """Second/third backup: Groq snippets, then optional direct Groq question."""
+    if snippets:
+        groq_result = await extract_groq_fallback_metric(
+            ticker,
+            snippets=snippets,
+            metric_label=metric_label,
+        )
+        if groq_result.metric:
+            return TickerResult(
+                ticker=ticker,
+                success=True,
+                source="groq_fallback",
+                metric=groq_result.metric,
+                confidence=groq_result.confidence,
+                error=groq_result.note,
+            )
+
+    if groq_direct_fallback_enabled():
+        direct_result = await extract_groq_direct_fallback_metric(ticker, metric_label=metric_label)
+        if direct_result.metric:
+            return TickerResult(
+                ticker=ticker,
+                success=True,
+                source="groq_direct_fallback",
+                metric=direct_result.metric,
+                confidence=direct_result.confidence,
+                error=direct_result.note,
+            )
+        if not snippets:
+            return TickerResult(
+                ticker=ticker,
+                success=False,
+                source="fallbacks",
+                error=direct_result.note or "Groq direct fallback returned no metric",
+            )
+
+    if groq_requires_snippets() and not snippets:
+        return TickerResult(
+            ticker=ticker,
+            success=False,
+            source="fallbacks",
+            error="Google fallback found no snippets; Groq snippet parse skipped",
+        )
+
+    return None
+
+
 @dataclass
 class TickerResult:
     ticker: str
@@ -71,14 +137,16 @@ class SheetJobResult:
     written: bool = False
 
 
-def compliance_sleep_seconds() -> int:
+def compliance_sleep_seconds(source: SourceKey | None = None) -> int:
+    if source == "gurufocus":
+        return GURUFOCUS_SLEEP_SECONDS
     if JITTER_SECONDS <= 0:
         return BASELINE_SLEEP_SECONDS
     return random.randint(max(0, BASELINE_SLEEP_SECONDS - JITTER_SECONDS), BASELINE_SLEEP_SECONDS + JITTER_SECONDS)
 
 
-async def compliance_sleep() -> None:
-    delay = compliance_sleep_seconds()
+async def compliance_sleep(source: SourceKey | None = None) -> None:
+    delay = compliance_sleep_seconds(source)
     logger.info("[schedule] Post-request pause: %d seconds", delay)
     await asyncio.sleep(delay)
 
@@ -200,26 +268,29 @@ async def process_ticker(ticker: str, proxy_pool: list[ProxyConfig]) -> TickerRe
                         metric=google_result.metric,
                         proxy=proxy.label,
                     )
-                groq_result = await extract_groq_fallback_metric(
+
+                groq_result = await _run_groq_fallback_chain(
                     ticker,
-                    snippets=snippets,
+                    snippets,
+                    source_metric_label("gurufocus"),
                 )
-                if groq_result.metric:
+                if groq_result:
                     return TickerResult(
                         ticker=ticker,
-                        success=True,
-                        source="groq_fallback",
+                        success=groq_result.success,
+                        source=groq_result.source,
                         metric=groq_result.metric,
                         proxy=proxy.label,
                         confidence=groq_result.confidence,
-                        error=groq_result.note,
+                        error=groq_result.error,
                     )
+
                 return TickerResult(
                     ticker=ticker,
                     success=False,
                     source="fallbacks",
                     proxy=proxy.label,
-                    error=groq_result.note or "Google and Groq fallbacks completed but no metric was found",
+                    error="Google and Groq fallbacks completed but no metric was found",
                 )
 
     except Exception as exc:
@@ -290,20 +361,20 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                         proxy=proxy.label,
                     )
 
-                groq_result = await extract_groq_fallback_metric(
+                groq_result = await _run_groq_fallback_chain(
                     job.ticker,
-                    snippets=snippets,
-                    metric_label=source_metric_label(job.source),
+                    snippets,
+                    source_metric_label(job.source),
                 )
-                if groq_result.metric:
+                if groq_result:
                     return TickerResult(
                         ticker=job.ticker,
-                        success=True,
-                        source="groq_fallback",
+                        success=groq_result.success,
+                        source=groq_result.source,
                         metric=groq_result.metric,
                         proxy=proxy.label,
                         confidence=groq_result.confidence,
-                        error=groq_result.note,
+                        error=groq_result.error,
                     )
 
                 return TickerResult(
@@ -311,7 +382,7 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                     success=False,
                     source="fallbacks",
                     proxy=proxy.label,
-                    error=groq_result.note or "Google and Groq fallbacks completed but no metric was found",
+                    error="Google and Groq fallbacks completed but no metric was found",
                 )
 
     except Exception as exc:
@@ -386,12 +457,13 @@ async def run_sheet_collector(
     logger.info("[sheet] Processing %d resilient sheet jobs dry_run=%s", len(jobs), dry_run)
     for job in jobs:
         logger.info(
-            "[sheet] queued row=%d ticker=%s source=%s col=%s label=%s",
+            "[sheet] queued row=%d ticker=%s source=%s col=%s label=%s current=%r",
             job.row,
             job.ticker,
             job.source,
             job.value_col,
             job.label,
+            job.current_value,
         )
 
     if dry_run:
@@ -423,29 +495,40 @@ async def run_sheet_collector(
         written = False
         if result.success and result.metric:
             value = format_for_sheet(result.metric)
-            await retry_sync("write_value", client.write_value, job, value)
-            written = True
-            logger.info(
-                "[sheet] Wrote row=%d col=%s ticker=%s value=%s source=%s",
-                job.row,
-                job.value_col,
-                job.ticker,
-                value,
-                result.source,
-            )
+            if value.strip():
+                await retry_sync("write_value", client.write_value, job, value)
+                written = True
+                logger.info(
+                    "[sheet] Wrote row=%d col=%s ticker=%s old=%r value=%s source=%s",
+                    job.row,
+                    job.value_col,
+                    job.ticker,
+                    job.current_value,
+                    value,
+                    result.source,
+                )
+            else:
+                logger.warning(
+                    "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r because result normalized empty",
+                    job.row,
+                    job.value_col,
+                    job.ticker,
+                    job.current_value,
+                )
         else:
             logger.warning(
-                "[sheet] Leaving row=%d col=%s ticker=%s unchanged error=%s",
+                "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r after no valid value error=%s",
                 job.row,
                 job.value_col,
                 job.ticker,
+                job.current_value,
                 result.error,
             )
 
         results.append(SheetJobResult(job=job, result=result, written=written))
 
         if index < len(jobs):
-            await compliance_sleep()
+            await compliance_sleep(job.source)
 
     return results
 
@@ -485,7 +568,7 @@ def main() -> None:
     parser.add_argument(
         "--sheet",
         action="store_true",
-        help="Read missing jobs from the Missing Value sheet and write successful results back",
+        help="Refresh ticker jobs from the Missing Value sheet and write successful results back",
     )
     parser.add_argument(
         "--dry-run",

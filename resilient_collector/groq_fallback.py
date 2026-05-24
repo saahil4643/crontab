@@ -18,7 +18,6 @@ GROQ_ENDPOINT = os.environ.get(
 )
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_TIMEOUT_SECONDS = float(os.environ.get("GROQ_TIMEOUT_SECONDS", "25"))
-GROQ_LENIENT_FALLBACK = os.environ.get("GROQ_LENIENT_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -78,28 +77,35 @@ def _parse_response(content: str) -> GroqFallbackResult:
     return GroqFallbackResult(metric=_extract_metric_from_text(content))
 
 
-def _build_prompt(
+def _build_snippet_prompt(
     ticker: str,
     snippets: list[str] | None = None,
     metric_label: str | None = None,
 ) -> str:
     snippet_text = "\n".join(f"- {snippet[:700]}" for snippet in (snippets or [])[:10])
     target = metric_label or "GuruFocus DCF Fair Value or intrinsic value per share"
-    if GROQ_LENIENT_FALLBACK:
-        source_text = snippet_text or "No useful search snippets were available."
-        return (
-            f"Find the best available numeric estimate for the {target} for ticker {ticker}.\n"
-            "Prefer the provided snippets when they contain the value. If snippets are missing or incomplete, "
-            "use your best financial knowledge or reasonable estimate.\n"
-            "Return only one numeric value with no currency symbol, no JSON, no words, and no explanation.\n"
-            f"Snippets:\n{source_text}"
-        )
     return (
         f"Extract the {target} for ticker {ticker} only from the snippets below.\n"
+        "Do not use model memory, training data, estimates, or guesses.\n"
         "Return only the numeric value with no currency symbol, no JSON, no words, and no explanation.\n"
         "If the requested value is not explicitly present in the snippets, return an empty response.\n"
         f"Snippets:\n{snippet_text}"
     )
+
+
+def _build_direct_prompt(ticker: str, metric_label: str | None = None) -> str:
+    target = metric_label or "GuruFocus Intrinsic Value: DCF (Earnings Based)"
+    return (
+        f"What is the {target} for ticker {ticker}?\n"
+        "Return only one numeric value with no currency symbol, no JSON, no words, and no explanation.\n"
+        "If you are not confident, or may be confusing it with GF Value, DCF FCF Based, "
+        "current price, margin of safety, or any other metric, return an empty response."
+    )
+
+
+def groq_direct_fallback_enabled() -> bool:
+    raw = os.environ.get("RESILIENT_GROQ_DIRECT_FALLBACK", "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _api_keys() -> list[str]:
@@ -132,18 +138,10 @@ async def _request_groq(api_key: str, payload: dict) -> GroqFallbackResult:
     return _parse_response(content)
 
 
-async def extract_groq_fallback_metric(
-    ticker: str,
-    snippets: list[str] | None = None,
-    metric_label: str | None = None,
-) -> GroqFallbackResult:
-    if not snippets and not GROQ_LENIENT_FALLBACK:
-        logger.warning("[%s] Groq fallback skipped: no search snippets to parse", ticker)
-        return GroqFallbackResult(metric=None, note="No search snippets to parse")
-
+async def _call_groq(user_prompt: str, *, ticker: str, log_label: str) -> GroqFallbackResult:
     api_keys = _api_keys()
     if not api_keys:
-        logger.warning("[%s] Groq fallback skipped: GROQ_API_KEY or GROQ_API_KEYS is not set", ticker)
+        logger.warning("[%s] %s skipped: GROQ_API_KEY or GROQ_API_KEYS is not set", ticker, log_label)
         return GroqFallbackResult(metric=None, note="GROQ_API_KEY or GROQ_API_KEYS is not set")
 
     payload = {
@@ -157,10 +155,7 @@ async def extract_groq_fallback_metric(
                     "No prose, no JSON, no currency symbol, no explanation."
                 ),
             },
-            {
-                "role": "user",
-                "content": _build_prompt(ticker, snippets, metric_label),
-            },
+            {"role": "user", "content": user_prompt},
         ],
     }
 
@@ -170,17 +165,54 @@ async def extract_groq_fallback_metric(
             result = await _request_groq(api_key, payload)
             if result.metric:
                 logger.info(
-                    "[%s] Groq fallback extracted metric=%s confidence=%s key_index=%d",
+                    "[%s] %s extracted metric=%s confidence=%s key_index=%d",
                     ticker,
+                    log_label,
                     result.metric,
                     result.confidence,
                     index,
                 )
             else:
-                logger.warning("[%s] Groq fallback returned no metric key_index=%d", ticker, index)
+                logger.warning("[%s] %s returned no metric key_index=%d", ticker, log_label, index)
             return result
         except Exception as exc:
             last_error = str(exc)
-            logger.warning("[%s] Groq fallback key_index=%d failed: %s", ticker, index, exc)
+            logger.warning("[%s] %s key_index=%d failed: %s", ticker, log_label, index, exc)
 
     return GroqFallbackResult(metric=None, note=last_error)
+
+
+async def extract_groq_fallback_metric(
+    ticker: str,
+    snippets: list[str] | None = None,
+    metric_label: str | None = None,
+) -> GroqFallbackResult:
+    if not snippets:
+        logger.warning("[%s] Groq snippet fallback skipped: no search snippets to parse", ticker)
+        return GroqFallbackResult(metric=None, note="No search snippets to parse")
+
+    return await _call_groq(
+        _build_snippet_prompt(ticker, snippets, metric_label),
+        ticker=ticker,
+        log_label="Groq snippet fallback",
+    )
+
+
+async def extract_groq_direct_fallback_metric(
+    ticker: str,
+    metric_label: str | None = None,
+) -> GroqFallbackResult:
+    if not groq_direct_fallback_enabled():
+        logger.info("[%s] Groq direct fallback disabled", ticker)
+        return GroqFallbackResult(metric=None, note="Groq direct fallback disabled")
+
+    logger.warning(
+        "[%s] Using Groq direct fallback (model memory; may be stale) for %s",
+        ticker,
+        metric_label or "requested metric",
+    )
+    return await _call_groq(
+        _build_direct_prompt(ticker, metric_label),
+        ticker=ticker,
+        log_label="Groq direct fallback",
+    )

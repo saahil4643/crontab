@@ -9,7 +9,7 @@ from config import SourceKey
 
 @dataclass(frozen=True)
 class ScrapeJob:
-    """One cell to fill on the Missing Value tab."""
+    """One sheet cell to refresh."""
 
     row: int  # 1-based sheet row
     ticker: str
@@ -17,4 +17,5 @@ class ScrapeJob:
     value_col: str
     value_col_index: int
     label: str
+    current_value: str = ""
     security_type: str = "nasdaq"  # Alpha Spread URL segment from the source block's index column
