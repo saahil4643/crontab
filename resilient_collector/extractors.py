@@ -25,12 +25,14 @@ from config import (
     VALUE_INVESTING_VALUATION_URL,
 )
 from models import ScrapeJob
+from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from scrapers.extract import extract_from_json_payloads, extract_from_text, normalize_numeric_string
 
 logger = logging.getLogger(__name__)
 DIRECT_TIMEOUT_MS = int(os.environ.get("DIRECT_SCRAPE_TIMEOUT_MS", "10000"))
 SERP_TIMEOUT_MS = int(os.environ.get("SERP_TIMEOUT_MS", "10000"))
-VALUEINVESTING_CARD_WAIT_MS = int(os.environ.get("VALUEINVESTING_CARD_WAIT_MS", "12000"))
+VALUEINVESTING_TABLE_WAIT_MS = int(os.environ.get("VALUEINVESTING_TABLE_WAIT_MS", "25000"))
+VALUEINVESTING_CARD_WAIT_MS = int(os.environ.get("VALUEINVESTING_CARD_WAIT_MS", "8000"))
 
 _FAIR_PRICE_LABELS = ("fair price", "fair value")
 _VALUEINVESTING_BLOCKED_MARKERS = (
@@ -39,7 +41,21 @@ _VALUEINVESTING_BLOCKED_MARKERS = (
     "start free trial",
     "create your account",
 )
+_VALUEINVESTING_LIMIT_MARKERS = (
+    "view limit",
+    "views remaining",
+    "you have reached",
+    "sign up to continue",
+    "subscribe to continue",
+    "unlock this content",
+    "free views",
+)
 _VALUEINVESTING_PLAN_PRICE = "14.99"
+_VALUEINVESTING_SUMMARY_TABLE_SELECTOR = "table.each_summary"
+_VALUEINVESTING_FAIR_PRICE_ROW_XPATH = (
+    "//table[contains(@class,'each_summary')]"
+    "//tr[td[normalize-space()='Fair Price']]"
+)
 
 
 @dataclass
@@ -338,8 +354,26 @@ def _label_matches_fair_price(label: str) -> bool:
     return any(marker in lowered for marker in _FAIR_PRICE_LABELS)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def valueinvesting_paths() -> tuple[str, ...]:
+    """Default: one URL per ticker to preserve free-tier view budget."""
+    if _env_bool("RESILIENT_VALUEINVESTING_MULTI_PATH", False):
+        return VALUE_INVESTING_PATHS
+    return (VALUE_INVESTING_PATHS[0],)
+
+
 def _valid_valueinvesting_metric(value: str | None) -> str | None:
     if not value or value == _VALUEINVESTING_PLAN_PRICE:
+        return None
+    if " - " in value:
+        return None
+    if value.endswith("%"):
         return None
     return value
 
@@ -351,7 +385,39 @@ async def _valueinvesting_metric_from_norm(locator) -> str | None:
     return _valid_valueinvesting_metric(normalize_numeric_string(raw))
 
 
-async def _valueinvesting_extract_fair_price_cards(page: Page, ticker: str) -> tuple[str, str] | None:
+async def _valueinvesting_extract_from_summary_table(page: Page, ticker: str) -> tuple[str, str] | None:
+    table = page.locator(_VALUEINVESTING_SUMMARY_TABLE_SELECTOR).first
+    try:
+        await table.wait_for(state="visible", timeout=VALUEINVESTING_TABLE_WAIT_MS)
+    except Exception:
+        logger.info(
+            "[%s] ValueInvesting %s not visible within %dms",
+            ticker,
+            _VALUEINVESTING_SUMMARY_TABLE_SELECTOR,
+            VALUEINVESTING_TABLE_WAIT_MS,
+        )
+        return None
+
+    fair_row = page.locator(f"xpath={_VALUEINVESTING_FAIR_PRICE_ROW_XPATH}").first
+    if await fair_row.count() == 0:
+        logger.info("[%s] ValueInvesting Fair Price row not found in each_summary", ticker)
+        return None
+
+    cells = fair_row.locator("td")
+    cell_count = await cells.count()
+    if cell_count < 3:
+        logger.info("[%s] ValueInvesting Fair Price row has %d cells (expected >= 3)", ticker, cell_count)
+        return None
+
+    cell_text = await cells.nth(2).inner_text(timeout=5000)
+    value = _valid_valueinvesting_metric(normalize_numeric_string(cell_text))
+    if value:
+        logger.info("[%s] ValueInvesting fair value via each_summary table -> %s", ticker, value)
+        return value, "each_summary_table"
+    return None
+
+
+async def _valueinvesting_extract_legacy_cards(page: Page, ticker: str) -> tuple[str, str] | None:
     card_locator = page.locator(".price_square").first
     try:
         await card_locator.wait_for(state="visible", timeout=VALUEINVESTING_CARD_WAIT_MS)
@@ -383,38 +449,53 @@ async def _valueinvesting_extract_fair_price_cards(page: Page, ticker: str) -> t
             logger.info("[%s] ValueInvesting fair value via price_square -> %s", ticker, value)
             return value, "card_square"
 
-    fair_row = page.locator(
-        'xpath=//tr[td[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", '
-        '"abcdefghijklmnopqrstuvwxyz"), "fair price")]]'
-    ).first
-    if await fair_row.count() > 0:
-        cells = fair_row.locator("td")
-        cell_count = await cells.count()
-        if cell_count >= 3:
-            cell_text = await cells.nth(2).inner_text(timeout=3000)
-            value = _valid_valueinvesting_metric(normalize_numeric_string(cell_text))
-            if value:
-                logger.info("[%s] ValueInvesting fair value via table row -> %s", ticker, value)
-                return value, "table_row"
-
     return None
+
+
+async def _valueinvesting_extract_fair_price(page: Page, ticker: str) -> tuple[str, str] | None:
+    extracted = await _valueinvesting_extract_from_summary_table(page, ticker)
+    if extracted:
+        return extracted
+    return await _valueinvesting_extract_legacy_cards(page, ticker)
+
+
+async def _valueinvesting_body_text(page: Page) -> str:
+    try:
+        return await page.locator("body").inner_text(timeout=10_000)
+    except Exception:
+        return await page.content()
+
+
+async def _valueinvesting_page_limit_reached(page: Page) -> bool:
+    try:
+        body = (await _valueinvesting_body_text(page)).lower()
+    except Exception:
+        return False
+    return any(marker in body for marker in _VALUEINVESTING_LIMIT_MARKERS)
 
 
 async def _valueinvesting_page_blocked(page: Page) -> bool:
     try:
-        body = (await page.locator("body").inner_text(timeout=8000)).lower()
+        body = (await _valueinvesting_body_text(page)).lower()
     except Exception:
+        return False
+    if await page.locator(_VALUEINVESTING_SUMMARY_TABLE_SELECTOR).count() > 0:
         return False
     if "discounted cash flow" in body or "dcf valuation" in body:
         return False
     return any(marker in body for marker in _VALUEINVESTING_BLOCKED_MARKERS)
 
 
-async def _extract_valueinvesting(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+async def extract_valueinvesting_metric(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+    """
+    Navigate to ValueInvesting and read Fair Price from each_summary (Selected column).
+
+    Raises ValueInvestingLimitError when the free view / signup wall is detected.
+    """
     ticker = job.ticker.strip().upper()
     last_error: Exception | None = None
 
-    for path in VALUE_INVESTING_PATHS:
+    for path in valueinvesting_paths():
         url = VALUE_INVESTING_VALUATION_URL.format(ticker=ticker, path=path)
         logger.info("[%s] ValueInvesting primary navigation: %s", ticker, url)
         try:
@@ -431,22 +512,25 @@ async def _extract_valueinvesting(page: Page, job: ScrapeJob) -> PrimaryExtracti
                 raise RuntimeError(f"ValueInvesting restrictive or unstable status: {status}")
 
             await _dismiss_overlays(page)
+
+            if await _valueinvesting_page_limit_reached(page):
+                raise ValueInvestingLimitError("ValueInvesting free view limit or signup wall")
+
             if await _valueinvesting_page_blocked(page):
                 raise RuntimeError("ValueInvesting pricing/login page")
 
-            extracted = await _valueinvesting_extract_fair_price_cards(page, ticker)
+            extracted = await _valueinvesting_extract_fair_price(page, ticker)
             if extracted:
                 metric, method = extracted
                 return PrimaryExtractionResult(metric=metric, method=method)
 
-            try:
-                text = await page.locator("body").inner_text(timeout=10_000)
-            except Exception:
-                text = await page.content()
+            text = await _valueinvesting_body_text(page)
             text_value = extract_from_text(text, _VALUEINVESTING_TEXT_PATTERNS)
             if text_value and text_value != _VALUEINVESTING_PLAN_PRICE:
                 logger.info("[%s] ValueInvesting fair value via text regex -> %s", ticker, text_value)
                 return PrimaryExtractionResult(metric=text_value, method="text")
+        except ValueInvestingLimitError:
+            raise
         except Exception as exc:
             last_error = exc
             logger.warning("[%s] ValueInvesting path %s failed: %s", ticker, path, exc)
@@ -454,6 +538,10 @@ async def _extract_valueinvesting(page: Page, job: ScrapeJob) -> PrimaryExtracti
 
     detail = str(last_error) if last_error else "Fair Price metric not found on any valuation page"
     raise RuntimeError(f"ValueInvesting metric not found ({detail})")
+
+
+async def _extract_valueinvesting(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+    return await extract_valueinvesting_metric(page, job)
 
 
 def _extract_gurufocus_earnings_value(text: str) -> str | None:

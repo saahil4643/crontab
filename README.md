@@ -76,3 +76,5 @@ The collector processes missing cells for:
 - Price Target High
 
 If a queued cell cannot be refreshed, its existing sheet value is left unchanged instead of writing `N/A`.
+
+ValueInvesting uses a batched browser (5 free views per identity by default), reads Fair Price from `table.each_summary`, and rotates the browser when the view budget is exhausted. See `docs/RESILIENT_COLLECTOR.md` for tuning env vars.

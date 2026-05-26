@@ -80,6 +80,34 @@ Google SERP navigation timeout. Default: `10000`.
 
 Delay after each job. Default: `6`.
 
+`RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY`
+
+Number of ValueInvesting ticker pages per fresh browser identity. Default: `5`.
+
+`RESILIENT_VALUEINVESTING_SLEEP_SECONDS`
+
+Delay after each ValueInvesting ticker in the batched pass (reduces rate limits when reusing one browser). Default: `15`.
+
+`RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS`
+
+Random +/- jitter added to the per-ticker delay. Default: `5` (so sleeps are roughly 10–20s).
+
+`RESILIENT_VALUEINVESTING_POST_ROTATION_SLEEP_SECONDS`
+
+Extra pause after closing a browser identity and before opening the next (every 5 tickers). Default: `12`.
+
+`RESILIENT_VALUEINVESTING_MULTI_PATH`
+
+When `1`, try all three valuation URLs per ticker (uses more free views). Default: `0` (only `dcf-growth-exit-5y`).
+
+`VALUEINVESTING_TABLE_WAIT_MS`
+
+Wait for `table.each_summary` before reading Fair Price. Default: `25000`.
+
+`VALUEINVESTING_CARD_WAIT_MS`
+
+Wait for legacy `.price_square` cards if the summary table is missing. Default: `8000`.
+
 `SHEET_RETRY_ATTEMPTS`
 
 Retry count for sheet reads/writes. Default: `6`.
@@ -162,3 +190,13 @@ kill $(cat logs/resilient_sheet_run.pid)
 Groq is used after the primary path and Google snippet collection. Snippet parsing is evidence-only. If that still fails, direct Groq is a last-resort backup (may be stale). If all fallbacks fail, the value is left unchanged.
 
 Sheet mode processes `alphaspread`, `valueinvesting`, `gurufocus`, `price_target_low`, `price_target_avg`, and `price_target_high`. Failed queued jobs are left unchanged so unavailable values do not overwrite existing sheet data.
+
+### ValueInvesting batching
+
+ValueInvesting jobs run first in one browser-batched pass (shared session, not deferred sheet writes):
+
+1. Reuse a single browser for up to `RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY` tickers (default 5).
+2. Rotate to a new browser identity (new context, rotated user-agent/viewport) when the budget is used.
+3. Read Fair Price from `table.each_summary` (Selected column) before legacy card selectors.
+4. On free-view limit / signup wall, rotate identity and retry the same ticker once.
+5. Write each successful result to column I immediately after scrape (same as other sources).

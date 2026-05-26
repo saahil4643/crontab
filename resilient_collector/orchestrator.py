@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import random
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -17,8 +18,11 @@ from resilient_collector.extractors import (
     extract_google_fallback_metric_for_job,
     extract_primary_metric,
     extract_primary_metric_for_job,
+    extract_valueinvesting_metric,
     source_metric_label,
 )
+from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
+from resilient_collector.valueinvesting_session import ValueInvestingSession
 from resilient_collector.env_loader import load_env_file
 from resilient_collector.groq_fallback import (
     extract_groq_direct_fallback_metric,
@@ -33,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 BASELINE_SLEEP_SECONDS = int(os.environ.get("RESILIENT_SLEEP_BASELINE_SECONDS", "6"))
 GURUFOCUS_SLEEP_SECONDS = int(os.environ.get("RESILIENT_GURUFOCUS_SLEEP_SECONDS", "90"))
+# Pause between ValueInvesting tickers to reduce rate limits when reusing one browser.
+VALUEINVESTING_SLEEP_SECONDS = int(os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_SECONDS", "15"))
+VALUEINVESTING_SLEEP_JITTER_SECONDS = int(
+    os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", "5")
+)
 JITTER_SECONDS = int(os.environ.get("RESILIENT_SLEEP_JITTER_SECONDS", "0"))
 SHEET_RETRY_ATTEMPTS = int(os.environ.get("SHEET_RETRY_ATTEMPTS", "6"))
 SHEET_RETRY_BASE_SECONDS = float(os.environ.get("SHEET_RETRY_BASE_SECONDS", "2"))
@@ -140,6 +149,12 @@ class SheetJobResult:
 def compliance_sleep_seconds(source: SourceKey | None = None) -> int:
     if source == "gurufocus":
         return GURUFOCUS_SLEEP_SECONDS
+    if source == "valueinvesting":
+        if VALUEINVESTING_SLEEP_JITTER_SECONDS <= 0:
+            return VALUEINVESTING_SLEEP_SECONDS
+        low = max(0, VALUEINVESTING_SLEEP_SECONDS - VALUEINVESTING_SLEEP_JITTER_SECONDS)
+        high = VALUEINVESTING_SLEEP_SECONDS + VALUEINVESTING_SLEEP_JITTER_SECONDS
+        return random.randint(low, high)
     if JITTER_SECONDS <= 0:
         return BASELINE_SLEEP_SECONDS
     return random.randint(max(0, BASELINE_SLEEP_SECONDS - JITTER_SECONDS), BASELINE_SLEEP_SECONDS + JITTER_SECONDS)
@@ -441,6 +456,149 @@ def _filter_sheet_jobs(
     return filtered
 
 
+def _partition_valueinvesting_jobs(jobs: list[ScrapeJob]) -> tuple[list[ScrapeJob], list[ScrapeJob]]:
+    vi_jobs = [job for job in jobs if job.source == "valueinvesting"]
+    other_jobs = [job for job in jobs if job.source != "valueinvesting"]
+    return vi_jobs, other_jobs
+
+
+async def _process_valueinvesting_with_session(
+    job: ScrapeJob,
+    session: ValueInvestingSession,
+    *,
+    allow_retry_on_limit: bool = True,
+) -> TickerResult:
+    proxy_label = session.proxy_label
+
+    async def _scrape_once() -> TickerResult:
+        page = await session.ensure_page()
+        primary = await extract_valueinvesting_metric(page, job)
+        session.record_view()
+        return TickerResult(
+            ticker=job.ticker,
+            success=True,
+            source=f"primary_{primary.method}",
+            metric=primary.metric,
+            proxy=proxy_label,
+        )
+
+    try:
+        return await _scrape_once()
+    except ValueInvestingLimitError as limit_exc:
+        session.record_view()
+        logger.warning(
+            "[%s] ValueInvesting view limit (%s); rotating browser identity",
+            job.ticker,
+            limit_exc,
+        )
+        if not allow_retry_on_limit:
+            return TickerResult(
+                ticker=job.ticker,
+                success=False,
+                source="valueinvesting_limit",
+                proxy=proxy_label,
+                error=str(limit_exc),
+            )
+        await session.rotate_identity()
+        try:
+            return await _scrape_once()
+        except Exception as retry_exc:
+            return TickerResult(
+                ticker=job.ticker,
+                success=False,
+                source="valueinvesting_limit",
+                proxy=proxy_label,
+                error=str(retry_exc),
+            )
+    except Exception as exc:
+        logger.warning("[%s] valueinvesting primary failed (%s)", job.ticker, exc)
+        session.record_view()
+        return TickerResult(
+            ticker=job.ticker,
+            success=False,
+            source="primary",
+            proxy=proxy_label,
+            error=str(exc),
+        )
+
+
+async def process_valueinvesting_jobs(
+    jobs: list[ScrapeJob],
+    proxy_pool: list[ProxyConfig],
+) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    """Scrape each VI job in a shared browser session; yield after each ticker for immediate sheet writes."""
+    if not jobs:
+        return
+
+    session = ValueInvestingSession(proxy_pool)
+    total = len(jobs)
+
+    try:
+        for index, job in enumerate(jobs, start=1):
+            logger.info(
+                "[sheet] Processing row=%d ticker=%s source=valueinvesting col=%s (VI %d/%d)",
+                job.row,
+                job.ticker,
+                job.value_col,
+                index,
+                total,
+            )
+            result = await _process_valueinvesting_with_session(job, session)
+            logger.info(
+                "[result] ticker=%s success=%s source=%s metric=%s error=%s",
+                result.ticker,
+                result.success,
+                result.source,
+                result.metric,
+                result.error,
+            )
+            yield job, result
+            if index < total:
+                await compliance_sleep("valueinvesting")  # anti-throttle between tickers
+    finally:
+        await session.close()
+
+
+async def _apply_job_result(
+    client: DcfSheetClient,
+    job: ScrapeJob,
+    result: TickerResult,
+) -> SheetJobResult:
+    written = False
+    if result.success and result.metric:
+        value = format_for_sheet(result.metric)
+        if value.strip():
+            await retry_sync("write_value", client.write_value, job, value)
+            written = True
+            logger.info(
+                "[sheet] Wrote row=%d col=%s ticker=%s old=%r value=%s source=%s",
+                job.row,
+                job.value_col,
+                job.ticker,
+                job.current_value,
+                value,
+                result.source,
+            )
+        else:
+            logger.warning(
+                "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r because result normalized empty",
+                job.row,
+                job.value_col,
+                job.ticker,
+                job.current_value,
+            )
+    else:
+        logger.warning(
+            "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r after no valid value error=%s",
+            job.row,
+            job.value_col,
+            job.ticker,
+            job.current_value,
+            result.error,
+        )
+    return SheetJobResult(job=job, result=result, written=written)
+
+
 async def run_sheet_collector(
     *,
     dry_run: bool = False,
@@ -473,7 +631,19 @@ async def run_sheet_collector(
     results: list[SheetJobResult] = []
     job_cache: dict[tuple[str, SourceKey], TickerResult] = {}
 
-    for index, job in enumerate(jobs, start=1):
+    vi_jobs, other_jobs = _partition_valueinvesting_jobs(jobs)
+    if vi_jobs:
+        logger.info(
+            "[sheet] ValueInvesting batch: %d jobs (shared browser, rotate identity every %s views)",
+            len(vi_jobs),
+            os.environ.get("RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY", "5"),
+        )
+        async for job, result in process_valueinvesting_jobs(vi_jobs, proxy_pool):
+            job_cache[(job.ticker, job.source)] = result
+            results.append(await _apply_job_result(client, job, result))
+
+    total_other = len(other_jobs)
+    for index, job in enumerate(other_jobs, start=1):
         logger.info(
             "[sheet] Processing row=%d ticker=%s source=%s col=%s (%d/%d)",
             job.row,
@@ -481,7 +651,7 @@ async def run_sheet_collector(
             job.source,
             job.value_col,
             index,
-            len(jobs),
+            total_other,
         )
 
         cache_key = (job.ticker, job.source)
@@ -492,42 +662,9 @@ async def run_sheet_collector(
             result = await process_job(job, proxy_pool)
             job_cache[cache_key] = result
 
-        written = False
-        if result.success and result.metric:
-            value = format_for_sheet(result.metric)
-            if value.strip():
-                await retry_sync("write_value", client.write_value, job, value)
-                written = True
-                logger.info(
-                    "[sheet] Wrote row=%d col=%s ticker=%s old=%r value=%s source=%s",
-                    job.row,
-                    job.value_col,
-                    job.ticker,
-                    job.current_value,
-                    value,
-                    result.source,
-                )
-            else:
-                logger.warning(
-                    "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r because result normalized empty",
-                    job.row,
-                    job.value_col,
-                    job.ticker,
-                    job.current_value,
-                )
-        else:
-            logger.warning(
-                "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r after no valid value error=%s",
-                job.row,
-                job.value_col,
-                job.ticker,
-                job.current_value,
-                result.error,
-            )
+        results.append(await _apply_job_result(client, job, result))
 
-        results.append(SheetJobResult(job=job, result=result, written=written))
-
-        if index < len(jobs):
+        if index < total_other:
             await compliance_sleep(job.source)
 
     return results
