@@ -693,7 +693,7 @@ def _parse_sources(raw: list[str] | None) -> set[SourceKey] | None:
 
 def main() -> None:
     load_env_file()
-    setup_logging()
+    setup_logging(also_stdout=True)
     parser = argparse.ArgumentParser(
         description="Resilient async collector with direct scrape, Google snippets, and Groq parsing",
     )

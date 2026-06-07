@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from config import SourceKey
@@ -13,12 +15,19 @@ from logging_setup import setup_logging
 from resilient_collector.env_loader import load_env_file
 from resilient_collector.orchestrator import SHEET_SOURCES, run_sheet_collector
 
-
 ROOT = Path(__file__).resolve().parent
+JOB_NAME = ROOT.name
 LOG_DIR = ROOT / "logs"
-OUT_FILE = LOG_DIR / "resilient_sheet_run.out"
 PID_FILE = LOG_DIR / "resilient_sheet_run.pid"
 XVFB_MARKER = "RESILIENT_XVFB_ACTIVE"
+
+_SCHEDULER_ROOT = "/home/raffay/cron_scheduler"
+if _SCHEDULER_ROOT not in sys.path:
+    sys.path.insert(0, _SCHEDULER_ROOT)
+
+from job_logging import daily_log_path, disable_stdout_tee, enable_stdout_tee  # noqa: E402
+
+worker_logger = logging.getLogger("cron62.worker")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -76,6 +85,10 @@ def maybe_reexec_with_xvfb(args: argparse.Namespace) -> None:
     os.execvpe(command[0], command, env)
 
 
+def worker_log_path() -> str:
+    return daily_log_path(JOB_NAME, str(LOG_DIR), role="worker")
+
+
 def start_background(argv: list[str]) -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     child_args = [arg for arg in argv if arg != "--background"]
@@ -85,7 +98,8 @@ def start_background(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if should_use_xvfb(args):
         command, env = with_xvfb(command)
-    with OUT_FILE.open("ab", buffering=0) as output:
+    log_path = worker_log_path()
+    with open(log_path, "ab", buffering=0) as output:
         process = subprocess.Popen(
             command,
             cwd=str(ROOT),
@@ -98,7 +112,7 @@ def start_background(argv: list[str]) -> int:
         )
     PID_FILE.write_text(f"{process.pid}\n", encoding="utf-8")
     print(f"started pid {process.pid}")
-    print(f"log {OUT_FILE.relative_to(ROOT)}")
+    print(f"log {Path(log_path).relative_to(ROOT)}")
     return 0
 
 
@@ -110,18 +124,49 @@ async def run(args: argparse.Namespace) -> None:
     )
 
 
-def main() -> int:
-    os.chdir(ROOT)
-    load_env_file()
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.background:
-        return start_background(sys.argv[1:])
-    maybe_reexec_with_xvfb(args)
-    setup_logging()
+def main(args: argparse.Namespace) -> int:
+    started = time.time()
+    worker_logger.info(
+        "RUN_START | dry_run=%s | limit=%s | sources=%s",
+        args.dry_run,
+        args.limit,
+        args.sources,
+    )
     asyncio.run(run(args))
+    elapsed = time.time() - started
+    worker_logger.info("RUN_SUMMARY | status=completed | elapsed_sec=%.0f", elapsed)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    os.chdir(ROOT)
+    load_env_file()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.background:
+        raise SystemExit(start_background(sys.argv[1:]))
+
+    maybe_reexec_with_xvfb(args)
+
+    global_worker_logger, log_path = setup_logging()
+    worker_logger = global_worker_logger
+    tee_handle = enable_stdout_tee(log_path)
+
+    status = "completed"
+    exit_code = 0
+    try:
+        exit_code = main(args)
+    except Exception as exc:
+        status = "failed"
+        exit_code = 1
+        worker_logger.exception("RUN_SUMMARY | status=failed | error=%s", exc)
+        print(f"Fatal error: {exc}")
+        raise
+    finally:
+        worker_logger.info(
+            "[LOG] Execution end: run_resilient_sheet.py | status=%s",
+            status,
+        )
+        disable_stdout_tee(tee_handle)
+    raise SystemExit(exit_code)
