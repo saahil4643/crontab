@@ -32,9 +32,9 @@ from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from scrapers.extract import extract_from_json_payloads, extract_from_text, normalize_numeric_string
 
 logger = logging.getLogger(__name__)
-DIRECT_TIMEOUT_MS = int(os.environ.get("DIRECT_SCRAPE_TIMEOUT_MS", "10000"))
-SERP_TIMEOUT_MS = int(os.environ.get("SERP_TIMEOUT_MS", "10000"))
-VALUEINVESTING_TABLE_WAIT_MS = int(os.environ.get("VALUEINVESTING_TABLE_WAIT_MS", "25000"))
+DIRECT_TIMEOUT_MS = int(os.environ.get("DIRECT_SCRAPE_TIMEOUT_MS", "30000"))
+SERP_TIMEOUT_MS = int(os.environ.get("SERP_TIMEOUT_MS", "15000"))
+VALUEINVESTING_TABLE_WAIT_MS = int(os.environ.get("VALUEINVESTING_TABLE_WAIT_MS", "35000"))
 VALUEINVESTING_CARD_WAIT_MS = int(os.environ.get("VALUEINVESTING_CARD_WAIT_MS", "8000"))
 
 _FAIR_PRICE_LABELS = ("fair price", "fair value")

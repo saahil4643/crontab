@@ -35,12 +35,12 @@ from sheet_client import DcfSheetClient
 
 logger = logging.getLogger(__name__)
 
-BASELINE_SLEEP_SECONDS = int(os.environ.get("RESILIENT_SLEEP_BASELINE_SECONDS", "6"))
+BASELINE_SLEEP_SECONDS = int(os.environ.get("RESILIENT_SLEEP_BASELINE_SECONDS", "8"))
 GURUFOCUS_SLEEP_SECONDS = int(os.environ.get("RESILIENT_GURUFOCUS_SLEEP_SECONDS", "90"))
 # Pause between ValueInvesting tickers to reduce rate limits when reusing one browser.
-VALUEINVESTING_SLEEP_SECONDS = int(os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_SECONDS", "15"))
+VALUEINVESTING_SLEEP_SECONDS = int(os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_SECONDS", "25"))
 VALUEINVESTING_SLEEP_JITTER_SECONDS = int(
-    os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", "5")
+    os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", "10")
 )
 JITTER_SECONDS = int(os.environ.get("RESILIENT_SLEEP_JITTER_SECONDS", "0"))
 SHEET_RETRY_ATTEMPTS = int(os.environ.get("SHEET_RETRY_ATTEMPTS", "6"))
@@ -126,6 +126,54 @@ async def _run_groq_fallback_chain(
         )
 
     return None
+
+
+async def _run_page_fallback_chain(
+    page: Page,
+    job: ScrapeJob,
+    proxy_label: str,
+) -> TickerResult:
+    """Google snippets then Groq after primary scrape failure."""
+    snippets: list[str] = []
+    try:
+        google_result = await extract_google_fallback_metric_for_job(page, job)
+        snippets = google_result.snippets
+    except Exception as google_exc:
+        logger.warning("[%s] Google fallback failed: %s", job.ticker, google_exc)
+        google_result = None
+
+    if google_result and google_result.metric:
+        return TickerResult(
+            ticker=job.ticker,
+            success=True,
+            source="google_fallback",
+            metric=google_result.metric,
+            proxy=proxy_label,
+        )
+
+    groq_result = await _run_groq_fallback_chain(
+        job.ticker,
+        snippets,
+        source_metric_label(job.source),
+    )
+    if groq_result:
+        return TickerResult(
+            ticker=job.ticker,
+            success=groq_result.success,
+            source=groq_result.source,
+            metric=groq_result.metric,
+            proxy=proxy_label,
+            confidence=groq_result.confidence,
+            error=groq_result.error,
+        )
+
+    return TickerResult(
+        ticker=job.ticker,
+        success=False,
+        source="fallbacks",
+        proxy=proxy_label,
+        error="Google and Groq fallbacks completed but no metric was found",
+    )
 
 
 @dataclass
@@ -359,46 +407,7 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                     job.source,
                     primary_exc,
                 )
-                snippets: list[str] = []
-                try:
-                    google_result = await extract_google_fallback_metric_for_job(page, job)
-                    snippets = google_result.snippets
-                except Exception as google_exc:
-                    logger.warning("[%s] Google fallback failed: %s", job.ticker, google_exc)
-                    google_result = None
-
-                if google_result and google_result.metric:
-                    return TickerResult(
-                        ticker=job.ticker,
-                        success=True,
-                        source="google_fallback",
-                        metric=google_result.metric,
-                        proxy=proxy.label,
-                    )
-
-                groq_result = await _run_groq_fallback_chain(
-                    job.ticker,
-                    snippets,
-                    source_metric_label(job.source),
-                )
-                if groq_result:
-                    return TickerResult(
-                        ticker=job.ticker,
-                        success=groq_result.success,
-                        source=groq_result.source,
-                        metric=groq_result.metric,
-                        proxy=proxy.label,
-                        confidence=groq_result.confidence,
-                        error=groq_result.error,
-                    )
-
-                return TickerResult(
-                    ticker=job.ticker,
-                    success=False,
-                    source="fallbacks",
-                    proxy=proxy.label,
-                    error="Google and Groq fallbacks completed but no metric was found",
-                )
+                return await _run_page_fallback_chain(page, job, proxy.label)
 
     except Exception as exc:
         logger.error("[%s] %s unrecoverable error: %s", job.ticker, job.source, exc)
@@ -492,34 +501,30 @@ async def _process_valueinvesting_with_session(
             limit_exc,
         )
         if not allow_retry_on_limit:
-            return TickerResult(
-                ticker=job.ticker,
-                success=False,
-                source="valueinvesting_limit",
-                proxy=proxy_label,
-                error=str(limit_exc),
-            )
+            session.record_view()
+            page = await session.ensure_page()
+            return await _run_page_fallback_chain(page, job, proxy_label)
         await session.rotate_identity()
         try:
             return await _scrape_once()
         except Exception as retry_exc:
-            return TickerResult(
-                ticker=job.ticker,
-                success=False,
-                source="valueinvesting_limit",
-                proxy=proxy_label,
-                error=str(retry_exc),
+            logger.warning(
+                "[%s] valueinvesting retry failed (%s); trying fallbacks",
+                job.ticker,
+                retry_exc,
             )
+            session.record_view()
+            page = await session.ensure_page()
+            return await _run_page_fallback_chain(page, job, proxy_label)
     except Exception as exc:
-        logger.warning("[%s] valueinvesting primary failed (%s)", job.ticker, exc)
-        session.record_view()
-        return TickerResult(
-            ticker=job.ticker,
-            success=False,
-            source="primary",
-            proxy=proxy_label,
-            error=str(exc),
+        logger.warning(
+            "[%s] valueinvesting primary failed (%s); trying fallbacks",
+            job.ticker,
+            exc,
         )
+        session.record_view()
+        page = await session.ensure_page()
+        return await _run_page_fallback_chain(page, job, proxy_label)
 
 
 async def process_valueinvesting_jobs(

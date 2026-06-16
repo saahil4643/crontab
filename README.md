@@ -11,7 +11,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Create `.env` in the project root (not committed to git):
+Create `.env` in the project root:
 
 ```bash
 SHEET_ID=your_spreadsheet_id
@@ -20,16 +20,25 @@ WORKSHEET_NAME=Missing Value
 SHEET_START_ROW=3
 GROQ_KEY_1=your_key
 GROQ_KEY_2=your_key
+
+# Timeouts (all sources: VI, GuruFocus, AlphaSpread, Yahoo)
+DIRECT_SCRAPE_TIMEOUT_MS=30000
+SERP_TIMEOUT_MS=15000
+VALUEINVESTING_TABLE_WAIT_MS=35000
+
+# Pacing
+RESILIENT_VALUEINVESTING_SLEEP_SECONDS=25
+RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS=10
+RESILIENT_VALUEINVESTING_POST_ROTATION_SLEEP_SECONDS=20
+RESILIENT_SLEEP_BASELINE_SECONDS=8
+RESILIENT_GURUFOCUS_SLEEP_SECONDS=90
+
 RESILIENT_HEADLESS=1
 RESILIENT_USE_XVFB=0
 RESILIENT_PROXY_MODE=direct
 ```
 
-Optional column override (`SHEET_COLUMNS`):
-
-```bash
-SHEET_COLUMNS=alphaspread:B:C:D:Alpha Spread|valueinvesting:G:H:I:ValueIo|gurufocus:M:N:O:GuruFocus|price_target_low:R:S:T:Price Target Low|price_target_avg:R:S:U:Price Target Average|price_target_high:R:S:V:Price Target High
-```
+Optional `SHEET_COLUMNS` if your sheet layout differs — see existing `.env` on Mac for format.
 
 Share the spreadsheet with the service account email from `keys.json` (Editor access).
 
@@ -63,8 +72,8 @@ Mac local dev: add `--no-xvfb` and point `GOOGLE_CREDENTIALS_PATH` at your local
 
 ## Sources
 
-Processes **missing cells only** for Alpha Spread, ValueInvesting, GuruFocus, and Yahoo price targets (low/avg/high). Failed jobs leave cells unchanged.
+Processes **missing cells only** for Alpha Spread, ValueInvesting, GuruFocus, and Yahoo price targets (low/avg/high).
 
-## Optional tuning (.env)
+All sources use Google → Groq fallback when primary scrape fails (including ValueInvesting).
 
-`RESILIENT_SLEEP_BASELINE_SECONDS=6` · `RESILIENT_GURUFOCUS_SLEEP_SECONDS=90` · `RESILIENT_VALUEINVESTING_SLEEP_SECONDS=15` · `RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY=5`
+Default timeouts and pacing are tuned for server reliability; override via `.env` if needed.
