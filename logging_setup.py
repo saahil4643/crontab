@@ -10,11 +10,11 @@ CRON62_ROOT = Path(__file__).resolve().parent
 JOB_NAME = CRON62_ROOT.name
 LOG_DIR = CRON62_ROOT / "logs"
 
-_SCHEDULER_ROOT = "/home/raffay/cron_scheduler"
-if str(_SCHEDULER_ROOT) not in sys.path:
-    sys.path.insert(0, _SCHEDULER_ROOT)
+from job_logging_import import get_job_logging
 
-from job_logging import configure_job_logger, log_run_banner  # noqa: E402
+_jl = get_job_logging()
+configure_job_logger = _jl.configure_job_logger
+log_run_banner = _jl.log_run_banner
 
 _worker_logger = logging.getLogger("cron62.worker")
 

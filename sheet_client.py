@@ -42,14 +42,14 @@ class DcfSheetClient:
 
     def collect_jobs(self, start_row: int = MISSING_VALUE_START_ROW) -> list[ScrapeJob]:
         """
-        Scan Missing Value source blocks and queue every ticker cell.
+        Scan Missing Value source blocks and queue cells that lack a real value.
 
-        The current value is carried with each job so failed refreshes can leave
-        existing cells untouched.
+        Empty cells and known placeholders (N/A, 0, etc.) are queued for refresh.
+        Cells that already hold data are skipped. The current value is carried with
+        each job so failed refreshes can leave existing cells untouched.
         """
         jobs: list[ScrapeJob] = []
-        existing_values = 0
-        missing_values = 0
+        skipped_existing = 0
         all_values = self._worksheet.get_all_values()
         if not all_values:
             logger.warning("Sheet is empty")
@@ -72,10 +72,9 @@ class DcfSheetClient:
                 current_value = ""
                 if value_idx < len(row):
                     current_value = str(row[value_idx]).strip()
-                if is_missing_cell_value(current_value):
-                    missing_values += 1
-                else:
-                    existing_values += 1
+                if not is_missing_cell_value(current_value):
+                    skipped_existing += 1
+                    continue
 
                 index_cell = ""
                 if index_idx < len(row):
@@ -96,10 +95,9 @@ class DcfSheetClient:
                 )
 
         logger.info(
-            "Found %d ticker cells to refresh (%d missing, %d already filled)",
+            "Found %d missing cells to refresh (%d skipped with existing values)",
             len(jobs),
-            missing_values,
-            existing_values,
+            skipped_existing,
         )
         return jobs
 

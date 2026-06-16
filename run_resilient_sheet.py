@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from config import SourceKey
+from config import SourceKey, validate_config
 from logging_setup import setup_logging
 from resilient_collector.env_loader import load_env_file
 from resilient_collector.orchestrator import SHEET_SOURCES, run_sheet_collector
@@ -21,11 +21,12 @@ LOG_DIR = ROOT / "logs"
 PID_FILE = LOG_DIR / "resilient_sheet_run.pid"
 XVFB_MARKER = "RESILIENT_XVFB_ACTIVE"
 
-_SCHEDULER_ROOT = "/home/raffay/cron_scheduler"
-if _SCHEDULER_ROOT not in sys.path:
-    sys.path.insert(0, _SCHEDULER_ROOT)
+from job_logging_import import get_job_logging
 
-from job_logging import daily_log_path, disable_stdout_tee, enable_stdout_tee  # noqa: E402
+_jl = get_job_logging()
+daily_log_path = _jl.daily_log_path
+disable_stdout_tee = _jl.disable_stdout_tee
+enable_stdout_tee = _jl.enable_stdout_tee
 
 worker_logger = logging.getLogger("cron62.worker")
 
@@ -141,6 +142,7 @@ def main(args: argparse.Namespace) -> int:
 if __name__ == "__main__":
     os.chdir(ROOT)
     load_env_file()
+    validate_config()
     parser = build_parser()
     args = parser.parse_args()
 

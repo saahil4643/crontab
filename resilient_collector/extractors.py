@@ -23,6 +23,9 @@ from config import (
     USER_AGENT,
     VALUE_INVESTING_PATHS,
     VALUE_INVESTING_VALUATION_URL,
+    YAHOO_CRUMB_URL,
+    YAHOO_QUOTE_SUMMARY_URL,
+    YAHOO_QUOTE_URL,
 )
 from models import ScrapeJob
 from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
@@ -644,7 +647,8 @@ def _price_targets_from_text(text: str) -> dict[str, str]:
 
 async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
     kind = _PRICE_TARGET_KIND[job.source]
-    url = f"https://finance.yahoo.com/quote/{job.ticker.strip().upper()}/"
+    ticker = job.ticker.strip().upper()
+    url = YAHOO_QUOTE_URL.format(ticker=ticker)
     logger.info("[%s] Yahoo primary navigation: %s", job.ticker, url)
     payloads, text = await _navigate_collect(
         page,
@@ -663,8 +667,9 @@ async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtraction
     )
     if json_value:
         return PrimaryExtractionResult(metric=json_value, method="json")
+    quote_summary_base = YAHOO_QUOTE_SUMMARY_URL.format(ticker=ticker)
     payload_text = await page.evaluate(
-        """async (ticker) => {
+        r"""async ({ ticker, crumbUrl, quoteSummaryBase }) => {
             let crumb = window?.YAHOO?.context?.user?.crumb || window?.YAHOO?.context?.crumb || '';
             if (!crumb) {
                 const html = document.documentElement.innerHTML || '';
@@ -672,7 +677,7 @@ async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtraction
                 crumb = match ? match[1] : '';
             }
             if (!crumb) {
-                const crumbResponse = await fetch('https://query1.finance.yahoo.com/v1/test/getcrumb', { credentials: 'include' });
+                const crumbResponse = await fetch(crumbUrl, { credentials: 'include' });
                 if (!crumbResponse.ok) throw new Error(`crumb status ${crumbResponse.status}`);
                 crumb = (await crumbResponse.text()).trim();
             }
@@ -683,12 +688,16 @@ async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtraction
                 region: 'US',
                 crumb,
             });
-            const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${ticker}?${params.toString()}`;
+            const url = `${quoteSummaryBase}?${params.toString()}`;
             const response = await fetch(url, { credentials: 'include' });
             if (!response.ok) throw new Error(`quoteSummary status ${response.status}`);
             return await response.text();
         }""",
-        job.ticker.strip().upper(),
+        {
+            "ticker": ticker,
+            "crumbUrl": YAHOO_CRUMB_URL,
+            "quoteSummaryBase": quote_summary_base,
+        },
     )
     payload = json.loads(payload_text)
     financial_data = (((payload.get("quoteSummary") or {}).get("result") or [{}])[0]).get("financialData") or {}

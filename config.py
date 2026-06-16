@@ -8,24 +8,107 @@ from typing import Literal
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 
-SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs/edit"
+
+def _bootstrap_env() -> None:
+    """Load .env before reading configuration defaults (inline to avoid import cycles)."""
+    env_path = _PACKAGE_DIR / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        cleaned = value.strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+            cleaned = cleaned[1:-1]
+        os.environ[key] = cleaned
+
+
+_bootstrap_env()
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name)
+    if not raw:
+        return default
+    return int(raw)
+
+
+def _require_env(name: str) -> str:
+    value = _env(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable {name}. Set it in .env before running."
+        )
+    return value
+
+
+# --- Google Sheets ---
+
+SHEET_ID = _env("SHEET_ID")
+_sheet_url = _env("SHEET_URL")
+SHEET_URL = _sheet_url or (
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit" if SHEET_ID else ""
 )
-SHEET_ID = "1YwVEq6lNXbocbt4NwnBR1WGg0tD_RLVaR1HJaurkaCs"
-WORKSHEET_MISSING_VALUE = "Missing Value"
+WORKSHEET_MISSING_VALUE = _env("WORKSHEET_NAME", "Missing Value")
+MISSING_VALUE_START_ROW = _env_int("SHEET_START_ROW", 3)
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-CREDENTIALS_PRIMARY = "/usr/local/share/keys.json"
+CREDENTIALS_PRIMARY = _env("GOOGLE_CREDENTIALS_PATH", "/usr/local/share/keys.json")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+# --- Scrape source URLs (override per deployment if needed) ---
+
+ALPHA_SPREAD_URL = _env(
+    "ALPHA_SPREAD_URL_TEMPLATE",
+    "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case",
 )
-PLAYWRIGHT_PROXY = os.environ.get("PLAYWRIGHT_PROXY", "http://127.0.0.1:10809")
+VALUE_INVESTING_URL = _env(
+    "VALUE_INVESTING_URL_TEMPLATE",
+    "https://valueinvesting.io/{ticker}/valuation/dcf-growth-exit-5y",
+)
+VALUE_INVESTING_VALUATION_URL = _env(
+    "VALUE_INVESTING_VALUATION_URL_TEMPLATE",
+    "https://valueinvesting.io/{ticker}/valuation/{path}",
+)
+GURUFOCUS_EARNINGS_TERM_URL = _env(
+    "GURUFOCUS_URL_TEMPLATE",
+    "https://www.gurufocus.com/term/intrinsic-value-dcf-earnings-based/{ticker}",
+)
+YAHOO_QUOTE_URL = _env(
+    "YAHOO_QUOTE_URL_TEMPLATE",
+    "https://finance.yahoo.com/quote/{ticker}/",
+)
+YAHOO_CRUMB_URL = _env(
+    "YAHOO_CRUMB_URL",
+    "https://query1.finance.yahoo.com/v1/test/getcrumb",
+)
+YAHOO_QUOTE_SUMMARY_URL = _env(
+    "YAHOO_QUOTE_SUMMARY_URL_TEMPLATE",
+    "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+)
+
+_paths_raw = _env("VALUE_INVESTING_PATHS", "dcf-growth-exit-5y,dcf-ebitda-exit-5y,dcf")
+VALUE_INVESTING_PATHS: tuple[str, ...] = tuple(
+    p.strip() for p in _paths_raw.split(",") if p.strip()
+)
+
+USER_AGENT = _env(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+)
+PLAYWRIGHT_PROXY = _env("PLAYWRIGHT_PROXY", "http://127.0.0.1:10809")
 
 MISSING_PLACEHOLDERS = frozenset({
     "",
@@ -62,25 +145,52 @@ class SheetColumnBlock:
     label: str
 
 
-MISSING_VALUE_START_ROW = 3
-MISSING_VALUE_BLOCKS: tuple[SheetColumnBlock, ...] = (
-    SheetColumnBlock("alphaspread", "B", "C", "D", "Alpha Spread"),
-    SheetColumnBlock("valueinvesting", "G", "H", "I", "ValueIo"),
-    SheetColumnBlock("gurufocus", "M", "N", "O", "GuruFocus"),
-    SheetColumnBlock("price_target_low", "R", "S", "T", "Price Target Low"),
-    SheetColumnBlock("price_target_avg", "R", "S", "U", "Price Target Average"),
-    SheetColumnBlock("price_target_high", "R", "S", "V", "Price Target High"),
+_DEFAULT_SHEET_COLUMNS = (
+    "alphaspread:B:C:D:Alpha Spread|"
+    "valueinvesting:G:H:I:ValueIo|"
+    "gurufocus:M:N:O:GuruFocus|"
+    "price_target_low:R:S:T:Price Target Low|"
+    "price_target_avg:R:S:U:Price Target Average|"
+    "price_target_high:R:S:V:Price Target High"
 )
 
-ALPHA_SPREAD_URL = "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case"
-VALUE_INVESTING_URL = "https://valueinvesting.io/{ticker}/valuation/dcf-growth-exit-5y"
-VALUE_INVESTING_VALUATION_URL = "https://valueinvesting.io/{ticker}/valuation/{path}"
-VALUE_INVESTING_PATHS: tuple[str, ...] = (
-    "dcf-growth-exit-5y",
-    "dcf-ebitda-exit-5y",
-    "dcf",
+
+def _parse_sheet_columns(raw: str) -> tuple[SheetColumnBlock, ...]:
+    """
+    Parse SHEET_COLUMNS env var.
+
+    Format: source:index:ticker:value:label blocks separated by |.
+    Example: alphaspread:B:C:D:Alpha Spread|valueinvesting:G:H:I:ValueIo
+    """
+    blocks: list[SheetColumnBlock] = []
+    for chunk in raw.split("|"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(":")]
+        if len(parts) != 5:
+            raise ValueError(
+                f"Invalid SHEET_COLUMNS block {chunk!r}; "
+                "expected source:index:ticker:value:label"
+            )
+        source, index_col, ticker_col, value_col, label = parts
+        blocks.append(
+            SheetColumnBlock(
+                source=source,  # type: ignore[arg-type]
+                index_col=index_col,
+                ticker_col=ticker_col,
+                value_col=value_col,
+                label=label,
+            )
+        )
+    if not blocks:
+        raise ValueError("SHEET_COLUMNS parsed to zero blocks")
+    return tuple(blocks)
+
+
+MISSING_VALUE_BLOCKS: tuple[SheetColumnBlock, ...] = _parse_sheet_columns(
+    _env("SHEET_COLUMNS", _DEFAULT_SHEET_COLUMNS)
 )
-GURUFOCUS_EARNINGS_TERM_URL = "https://www.gurufocus.com/term/intrinsic-value-dcf-earnings-based/{ticker}"
 
 JSON_URL_HINTS_ALPHASPREAD = ("alphaspread", "dcf", "valuation")
 JSON_URL_HINTS_VALUEINVESTING = ("valueinvesting", "valuation", "dcf", "fair")
@@ -128,4 +238,11 @@ PRICE_TARGET_TEXT_REGEX: dict[str, tuple[str, ...]] = {
     ),
 }
 
-DEFAULT_SECURITY_TYPE = "nasdaq"
+DEFAULT_SECURITY_TYPE = _env("DEFAULT_SECURITY_TYPE", "nasdaq")
+
+
+def validate_config() -> None:
+    """Fail fast when required sheet settings are missing."""
+    _require_env("SHEET_ID")
+    if not SHEET_URL:
+        raise RuntimeError("SHEET_URL could not be derived; set SHEET_ID or SHEET_URL in .env")

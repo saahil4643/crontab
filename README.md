@@ -1,80 +1,70 @@
 # Resilient Sheet Collector
 
-Runs the Missing Value sheet fill using one Python entrypoint:
+Fills missing valuation cells in a Google Sheet using Playwright scraping with Google/Groq fallbacks.
+
+## Server setup
 
 ```bash
-python run_resilient_sheet.py
-```
-
-## Setup
-
-```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-sudo apt install xvfb
 ```
 
-Place Google credentials at:
+Create `.env` in the project root (not committed to git):
 
 ```bash
-/usr/local/share/keys.json
+SHEET_ID=your_spreadsheet_id
+GOOGLE_CREDENTIALS_PATH=/usr/local/share/keys.json
+WORKSHEET_NAME=Missing Value
+SHEET_START_ROW=3
+GROQ_KEY_1=your_key
+GROQ_KEY_2=your_key
+RESILIENT_HEADLESS=1
+RESILIENT_USE_XVFB=0
+RESILIENT_PROXY_MODE=direct
 ```
 
-Add Groq keys and optional proxy settings to `.env`:
+Optional column override (`SHEET_COLUMNS`):
 
 ```bash
-GROQ_KEY_1=your_first_key
-GROQ_KEY_2=your_second_key
-RESILIENT_FORWARD_PROXY=http://127.0.0.1:10809
-RESILIENT_USE_XVFB=1
-RESILIENT_HEADLESS=0
+SHEET_COLUMNS=alphaspread:B:C:D:Alpha Spread|valueinvesting:G:H:I:ValueIo|gurufocus:M:N:O:GuruFocus|price_target_low:R:S:T:Price Target Low|price_target_avg:R:S:U:Price Target Average|price_target_high:R:S:V:Price Target High
 ```
+
+Share the spreadsheet with the service account email from `keys.json` (Editor access).
 
 ## Run
 
-Dry run:
+Test:
 
 ```bash
 python run_resilient_sheet.py --dry-run --limit 3
 ```
 
-Foreground run:
-
-```bash
-python run_resilient_sheet.py
-```
-
-Background run:
+Background (production):
 
 ```bash
 python run_resilient_sheet.py --background
 ```
 
-The runner automatically uses `xvfb-run` when no display is available. Use `--no-xvfb` only if you intentionally want no virtual display.
-
 Watch logs:
 
 ```bash
-tail -f logs/resilient_sheet_run.out
+tail -f logs/*worker*.log
 ```
 
-Stop background run:
+Stop:
 
 ```bash
 kill $(cat logs/resilient_sheet_run.pid)
 ```
 
+Mac local dev: add `--no-xvfb` and point `GOOGLE_CREDENTIALS_PATH` at your local JSON file.
+
 ## Sources
 
-The collector processes missing cells for:
+Processes **missing cells only** for Alpha Spread, ValueInvesting, GuruFocus, and Yahoo price targets (low/avg/high). Failed jobs leave cells unchanged.
 
-- Alpha Spread
-- ValueInvesting
-- GuruFocus
-- Price Target Low
-- Price Target Average
-- Price Target High
+## Optional tuning (.env)
 
-If a queued cell cannot be refreshed, its existing sheet value is left unchanged instead of writing `N/A`.
-
-ValueInvesting uses a batched browser (5 free views per identity by default), reads Fair Price from `table.each_summary`, and rotates the browser when the view budget is exhausted. See `docs/RESILIENT_COLLECTOR.md` for tuning env vars.
+`RESILIENT_SLEEP_BASELINE_SECONDS=6` · `RESILIENT_GURUFOCUS_SLEEP_SECONDS=90` · `RESILIENT_VALUEINVESTING_SLEEP_SECONDS=15` · `RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY=5`

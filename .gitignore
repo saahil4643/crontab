@@ -1,15 +1,26 @@
 __pycache__/
 *.py[cod]
+*$py.class
 venv/
 .venv/
+ven/
+
+# Secrets — never commit
 keys.json
 .env
 gurufocus_auth.json
+
+# Runtime artifacts
 logs/*.log
 logs/*.out
+logs/*.pid
 logs/captures/
 logs/capture-test/
 debug_*.png
 .playwright/
 browser-profile/
-.env
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
