@@ -1,6 +1,6 @@
 # Resilient Sheet Collector
 
-Fills missing valuation cells in a Google Sheet using Playwright scraping with Google/Groq fallbacks.
+Fills missing valuation cells in a Google Sheet using Playwright scraping with Google search fallback.
 
 ## Server setup
 
@@ -18,10 +18,6 @@ SHEET_ID=your_spreadsheet_id
 GOOGLE_CREDENTIALS_PATH=/usr/local/share/keys.json
 WORKSHEET_NAME=Missing Value
 SHEET_START_ROW=3
-GROQ_KEY_1=your_key
-GROQ_KEY_2=your_key
-
-# Timeouts (all sources: VI, GuruFocus, AlphaSpread, Yahoo)
 DIRECT_SCRAPE_TIMEOUT_MS=30000
 SERP_TIMEOUT_MS=15000
 VALUEINVESTING_TABLE_WAIT_MS=35000
@@ -74,6 +70,6 @@ Mac local dev: add `--no-xvfb` and point `GOOGLE_CREDENTIALS_PATH` at your local
 
 Processes **missing cells only** for Alpha Spread, ValueInvesting, GuruFocus, and Yahoo price targets (low/avg/high).
 
-All sources use Google → Groq fallback when primary scrape fails (including ValueInvesting).
+All sources use Google search fallback when primary scrape fails.
 
 Default timeouts and pacing are tuned for server reliability; override via `.env` if needed.

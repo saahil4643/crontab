@@ -19,16 +19,10 @@ from resilient_collector.extractors import (
     extract_primary_metric,
     extract_primary_metric_for_job,
     extract_valueinvesting_metric,
-    source_metric_label,
 )
 from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from resilient_collector.valueinvesting_session import ValueInvestingSession
 from resilient_collector.env_loader import load_env_file
-from resilient_collector.groq_fallback import (
-    extract_groq_direct_fallback_metric,
-    extract_groq_fallback_metric,
-    groq_direct_fallback_enabled,
-)
 from resilient_collector.proxy_pool import ProxyConfig, build_validated_pool
 from scrapers.extract import format_for_sheet
 from sheet_client import DcfSheetClient
@@ -67,82 +61,25 @@ def browser_headless() -> bool:
     return env_bool("RESILIENT_HEADLESS", False)
 
 
-def groq_requires_snippets() -> bool:
-    raw = os.environ.get("RESILIENT_GROQ_REQUIRE_SNIPPETS")
-    if raw is None:
-        raw = os.environ.get("GROQ_REQUIRE_SNIPPETS")
-    if raw is None:
-        return True
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-async def _run_groq_fallback_chain(
-    ticker: str,
-    snippets: list[str],
-    metric_label: str,
-) -> TickerResult | None:
-    """Second/third backup: Groq snippets, then optional direct Groq question."""
-    if snippets:
-        groq_result = await extract_groq_fallback_metric(
-            ticker,
-            snippets=snippets,
-            metric_label=metric_label,
-        )
-        if groq_result.metric:
-            return TickerResult(
-                ticker=ticker,
-                success=True,
-                source="groq_fallback",
-                metric=groq_result.metric,
-                confidence=groq_result.confidence,
-                error=groq_result.note,
-            )
-
-    if groq_direct_fallback_enabled():
-        direct_result = await extract_groq_direct_fallback_metric(ticker, metric_label=metric_label)
-        if direct_result.metric:
-            return TickerResult(
-                ticker=ticker,
-                success=True,
-                source="groq_direct_fallback",
-                metric=direct_result.metric,
-                confidence=direct_result.confidence,
-                error=direct_result.note,
-            )
-        if not snippets:
-            return TickerResult(
-                ticker=ticker,
-                success=False,
-                source="fallbacks",
-                error=direct_result.note or "Groq direct fallback returned no metric",
-            )
-
-    if groq_requires_snippets() and not snippets:
-        return TickerResult(
-            ticker=ticker,
-            success=False,
-            source="fallbacks",
-            error="Google fallback found no snippets; Groq snippet parse skipped",
-        )
-
-    return None
-
-
 async def _run_page_fallback_chain(
     page: Page,
     job: ScrapeJob,
     proxy_label: str,
 ) -> TickerResult:
-    """Google snippets then Groq after primary scrape failure."""
-    snippets: list[str] = []
+    """Google search fallback after primary scrape failure."""
     try:
         google_result = await extract_google_fallback_metric_for_job(page, job)
-        snippets = google_result.snippets
     except Exception as google_exc:
         logger.warning("[%s] Google fallback failed: %s", job.ticker, google_exc)
-        google_result = None
+        return TickerResult(
+            ticker=job.ticker,
+            success=False,
+            source="fallbacks",
+            proxy=proxy_label,
+            error=str(google_exc),
+        )
 
-    if google_result and google_result.metric:
+    if google_result.metric:
         return TickerResult(
             ticker=job.ticker,
             success=True,
@@ -151,28 +88,12 @@ async def _run_page_fallback_chain(
             proxy=proxy_label,
         )
 
-    groq_result = await _run_groq_fallback_chain(
-        job.ticker,
-        snippets,
-        source_metric_label(job.source),
-    )
-    if groq_result:
-        return TickerResult(
-            ticker=job.ticker,
-            success=groq_result.success,
-            source=groq_result.source,
-            metric=groq_result.metric,
-            proxy=proxy_label,
-            confidence=groq_result.confidence,
-            error=groq_result.error,
-        )
-
     return TickerResult(
         ticker=job.ticker,
         success=False,
         source="fallbacks",
         proxy=proxy_label,
-        error="Google and Groq fallbacks completed but no metric was found",
+        error="Google fallback completed but no metric was found",
     )
 
 
@@ -315,10 +236,8 @@ async def process_ticker(ticker: str, proxy_pool: list[ProxyConfig]) -> TickerRe
                     ticker,
                     primary_exc,
                 )
-                snippets: list[str] = []
                 try:
                     google_result = await extract_google_fallback_metric(page, ticker)
-                    snippets = google_result.snippets
                 except Exception as google_exc:
                     logger.warning("[%s] Google fallback failed: %s", ticker, google_exc)
                     google_result = None
@@ -332,28 +251,12 @@ async def process_ticker(ticker: str, proxy_pool: list[ProxyConfig]) -> TickerRe
                         proxy=proxy.label,
                     )
 
-                groq_result = await _run_groq_fallback_chain(
-                    ticker,
-                    snippets,
-                    source_metric_label("gurufocus"),
-                )
-                if groq_result:
-                    return TickerResult(
-                        ticker=ticker,
-                        success=groq_result.success,
-                        source=groq_result.source,
-                        metric=groq_result.metric,
-                        proxy=proxy.label,
-                        confidence=groq_result.confidence,
-                        error=groq_result.error,
-                    )
-
                 return TickerResult(
                     ticker=ticker,
                     success=False,
                     source="fallbacks",
                     proxy=proxy.label,
-                    error="Google and Groq fallbacks completed but no metric was found",
+                    error="Google fallback completed but no metric was found",
                 )
 
     except Exception as exc:
@@ -700,7 +603,7 @@ def main() -> None:
     load_env_file()
     setup_logging(also_stdout=True)
     parser = argparse.ArgumentParser(
-        description="Resilient async collector with direct scrape, Google snippets, and Groq parsing",
+        description="Resilient async collector with direct scrape and Google search fallback",
     )
     parser.add_argument(
         "tickers",
