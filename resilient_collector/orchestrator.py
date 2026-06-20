@@ -26,6 +26,7 @@ from resilient_collector.env_loader import load_env_file
 from resilient_collector.proxy_pool import ProxyConfig, build_validated_pool
 from scrapers.extract import format_for_sheet
 from sheet_client import DcfSheetClient
+from sheet_utils import has_stored_cell_value
 
 logger = logging.getLogger(__name__)
 
@@ -467,11 +468,46 @@ async def process_valueinvesting_jobs(
         await session.close()
 
 
+async def _clear_stale_cell(client: DcfSheetClient, job: ScrapeJob, *, reason: str) -> bool:
+    if not has_stored_cell_value(job.current_value):
+        logger.info(
+            "[sheet] row=%d col=%s ticker=%s already empty (%s)",
+            job.row,
+            job.value_col,
+            job.ticker,
+            reason,
+        )
+        return False
+    await retry_sync("clear_value", client.clear_value, job)
+    logger.info(
+        "[sheet] Cleared row=%d col=%s ticker=%s old=%r reason=%s",
+        job.row,
+        job.value_col,
+        job.ticker,
+        job.current_value,
+        reason,
+    )
+    return True
+
+
+async def _apply_clear_only_job(client: DcfSheetClient, job: ScrapeJob) -> SheetJobResult:
+    index_hint = job.index_label or job.security_type
+    cleared = await _clear_stale_cell(
+        client,
+        job,
+        reason=f"non-US index {index_hint!r}",
+    )
+    return SheetJobResult(job=job, result=None, written=cleared)
+
+
 async def _apply_job_result(
     client: DcfSheetClient,
     job: ScrapeJob,
     result: TickerResult,
 ) -> SheetJobResult:
+    if job.clear_only:
+        return await _apply_clear_only_job(client, job)
+
     written = False
     if result.success and result.metric:
         value = format_for_sheet(result.metric)
@@ -487,21 +523,23 @@ async def _apply_job_result(
                 value,
                 result.source,
             )
+        elif await _clear_stale_cell(client, job, reason="normalized scrape result empty"):
+            written = True
         else:
             logger.warning(
-                "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r because result normalized empty",
+                "[sheet] Left empty row=%d col=%s ticker=%s after normalized empty result",
                 job.row,
                 job.value_col,
                 job.ticker,
-                job.current_value,
             )
+    elif await _clear_stale_cell(client, job, reason=result.error or "scrape failed"):
+        written = True
     else:
-        logger.warning(
-            "[sheet] Left unchanged row=%d col=%s ticker=%s old=%r after no valid value error=%s",
+        logger.info(
+            "[sheet] Left empty row=%d col=%s ticker=%s after no valid value error=%s",
             job.row,
             job.value_col,
             job.ticker,
-            job.current_value,
             result.error,
         )
     return SheetJobResult(job=job, result=result, written=written)
@@ -520,16 +558,27 @@ async def run_sheet_collector(
         logger.info("[sheet] Nothing to process")
         return []
 
-    logger.info("[sheet] Processing %d resilient sheet jobs dry_run=%s", len(jobs), dry_run)
+    clear_jobs = [job for job in jobs if job.clear_only]
+    scrape_jobs = [job for job in jobs if not job.clear_only]
+    logger.info(
+        "[sheet] Processing %d jobs (%d scrape, %d non-US clear) dry_run=%s",
+        len(jobs),
+        len(scrape_jobs),
+        len(clear_jobs),
+        dry_run,
+    )
     for job in jobs:
         logger.info(
-            "[sheet] queued row=%d ticker=%s source=%s col=%s label=%s current=%r",
+            "[sheet] queued row=%d ticker=%s source=%s col=%s label=%s index=%r "
+            "current=%r clear_only=%s",
             job.row,
             job.ticker,
             job.source,
             job.value_col,
             job.label,
+            job.index_label,
             job.current_value,
+            job.clear_only,
         )
 
     if dry_run:
@@ -539,7 +588,10 @@ async def run_sheet_collector(
     results: list[SheetJobResult] = []
     job_cache: dict[tuple[str, SourceKey], TickerResult] = {}
 
-    vi_jobs, other_jobs = _partition_valueinvesting_jobs(jobs)
+    for job in clear_jobs:
+        results.append(await _apply_clear_only_job(client, job))
+
+    vi_jobs, other_jobs = _partition_valueinvesting_jobs(scrape_jobs)
     if vi_jobs:
         logger.info(
             "[sheet] ValueInvesting batch: %d jobs (shared browser, rotate identity every %s views)",

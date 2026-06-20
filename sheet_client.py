@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import gspread
 from gspread import Worksheet
@@ -16,11 +17,22 @@ from config import (
 )
 from credentials import get_credentials
 from models import ScrapeJob
-from sheet_utils import col_letter_to_index, is_missing_cell_value, normalize_security_type
+from sheet_utils import (
+    col_letter_to_index,
+    has_stored_cell_value,
+    is_missing_cell_value,
+    is_us_market_index,
+    normalize_security_type,
+)
 
 logger = logging.getLogger(__name__)
 
 _HEADER_TICKERS = frozenset({"STOCK NAME", "TICKER", "SYMBOL"})
+
+
+def _refresh_all_cells() -> bool:
+    raw = os.environ.get("RESILIENT_REFRESH_MODE", "all").strip().lower()
+    return raw not in {"missing_only", "missing", "empty_only"}
 
 
 class DcfSheetClient:
@@ -42,14 +54,16 @@ class DcfSheetClient:
 
     def collect_jobs(self, start_row: int = MISSING_VALUE_START_ROW) -> list[ScrapeJob]:
         """
-        Scan Missing Value source blocks and queue cells that lack a real value.
+        Queue sheet cells for refresh.
 
-        Empty cells and known placeholders (N/A, 0, etc.) are queued for refresh.
-        Cells that already hold data are skipped. The current value is carried with
-        each job so failed refreshes can leave existing cells untouched.
+        US (Nasdaq/NYSE): scrape every value column (missing or existing).
+        Non-US: skip scraping; queue clear-only jobs when a stale value exists.
         """
         jobs: list[ScrapeJob] = []
+        refresh_all = _refresh_all_cells()
         skipped_existing = 0
+        skipped_non_us_empty = 0
+        clear_non_us = 0
         all_values = self._worksheet.get_all_values()
         if not all_values:
             logger.warning("Sheet is empty")
@@ -72,14 +86,36 @@ class DcfSheetClient:
                 current_value = ""
                 if value_idx < len(row):
                     current_value = str(row[value_idx]).strip()
-                if not is_missing_cell_value(current_value):
-                    skipped_existing += 1
-                    continue
 
                 index_cell = ""
                 if index_idx < len(row):
                     index_cell = str(row[index_idx]).strip()
                 security_type = normalize_security_type(index_cell)
+
+                if not is_us_market_index(index_cell):
+                    if has_stored_cell_value(current_value):
+                        jobs.append(
+                            ScrapeJob(
+                                row=row_num,
+                                ticker=ticker,
+                                source=block.source,
+                                value_col=block.value_col,
+                                value_col_index=col_letter_to_index(block.value_col),
+                                label=block.label,
+                                current_value=current_value,
+                                security_type=security_type,
+                                index_label=index_cell,
+                                clear_only=True,
+                            )
+                        )
+                        clear_non_us += 1
+                    else:
+                        skipped_non_us_empty += 1
+                    continue
+
+                if not refresh_all and not is_missing_cell_value(current_value):
+                    skipped_existing += 1
+                    continue
 
                 jobs.append(
                     ScrapeJob(
@@ -91,13 +127,19 @@ class DcfSheetClient:
                         label=block.label,
                         current_value=current_value,
                         security_type=security_type,
+                        index_label=index_cell,
                     )
                 )
 
         logger.info(
-            "Found %d missing cells to refresh (%d skipped with existing values)",
+            "Queued %d jobs (%d scrape, %d non-US clear, %d skipped existing, "
+            "%d non-US empty skipped) refresh_mode=%s",
             len(jobs),
+            len(jobs) - clear_non_us,
+            clear_non_us,
             skipped_existing,
+            skipped_non_us_empty,
+            "all" if refresh_all else "missing_only",
         )
         return jobs
 
@@ -110,4 +152,15 @@ class DcfSheetClient:
             job.label,
             job.ticker,
             value,
+        )
+
+    def clear_value(self, job: ScrapeJob) -> None:
+        self._worksheet.update_cell(job.row, job.value_col_index, "")
+        logger.info(
+            "Cleared row %d col %s (%s) %s old=%r",
+            job.row,
+            job.value_col,
+            job.label,
+            job.ticker,
+            job.current_value,
         )

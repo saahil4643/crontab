@@ -19,3 +19,5 @@ class ScrapeJob:
     label: str
     current_value: str = ""
     security_type: str = "nasdaq"  # Alpha Spread URL segment from the source block's index column
+    index_label: str = ""  # raw Index column (column G) for logging
+    clear_only: bool = False  # non-US row: clear stale value without scraping
