@@ -14,6 +14,7 @@ gurufocus_auth.json
 logs/*.log
 logs/*.out
 logs/*.pid
+logs/pending_sheet_writes.jsonl
 logs/captures/
 logs/capture-test/
 debug_*.png

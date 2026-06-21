@@ -8,17 +8,31 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from config import SourceKey, validate_config
 from logging_setup import setup_logging
 from resilient_collector.env_loader import load_env_file
 from resilient_collector.orchestrator import SHEET_SOURCES, run_sheet_collector
+from worker_shutdown import (
+    ShutdownController,
+    acquire_instance_lock,
+    existing_worker_pid,
+    flush_log_handlers,
+    heartbeat_loop,
+    install_signal_handlers,
+    log_run_summary,
+    release_instance_lock,
+    remove_pid_file,
+    write_pid_file,
+)
 
 ROOT = Path(__file__).resolve().parent
 JOB_NAME = ROOT.name
 LOG_DIR = ROOT / "logs"
 PID_FILE = LOG_DIR / "resilient_sheet_run.pid"
+LOCK_FILE = LOG_DIR / "resilient_sheet_run.lock"
 XVFB_MARKER = "RESILIENT_XVFB_ACTIVE"
 
 from job_logging_import import get_job_logging
@@ -91,6 +105,11 @@ def worker_log_path() -> str:
 
 
 def start_background(argv: list[str]) -> int:
+    running_pid = existing_worker_pid(PID_FILE)
+    if running_pid is not None:
+        print(f"already running pid {running_pid}")
+        return 1
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     child_args = [arg for arg in argv if arg != "--background"]
     command = [sys.executable, str(Path(__file__).resolve()), *child_args]
@@ -117,25 +136,48 @@ def start_background(argv: list[str]) -> int:
     return 0
 
 
-async def run(args: argparse.Namespace) -> None:
-    await run_sheet_collector(
-        dry_run=args.dry_run,
-        limit=args.limit,
-        sources=parse_sources(args.sources),
-    )
+async def _run_worker(args: argparse.Namespace, shutdown: ShutdownController) -> list:
+    install_signal_handlers(shutdown, worker_logger)
+    heartbeat_task = asyncio.create_task(heartbeat_loop(worker_logger, shutdown))
+    try:
+        return await run_sheet_collector(
+            dry_run=args.dry_run,
+            limit=args.limit,
+            sources=parse_sources(args.sources),
+            shutdown=shutdown,
+        )
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
-def main(args: argparse.Namespace) -> int:
+def run_worker(args: argparse.Namespace, shutdown: ShutdownController) -> int:
     started = time.time()
     worker_logger.info(
-        "RUN_START | dry_run=%s | limit=%s | sources=%s",
+        "RUN_START | dry_run=%s | limit=%s | sources=%s | pid=%s",
         args.dry_run,
         args.limit,
         args.sources,
+        os.getpid(),
     )
-    asyncio.run(run(args))
+    asyncio.run(_run_worker(args, shutdown))
     elapsed = time.time() - started
-    worker_logger.info("RUN_SUMMARY | status=completed | elapsed_sec=%.0f", elapsed)
+    if shutdown.is_requested():
+        log_run_summary(
+            worker_logger,
+            status="interrupted",
+            reason=shutdown.reason,
+            elapsed_sec=elapsed,
+            progress=shutdown.progress,
+        )
+        return 130
+    log_run_summary(
+        worker_logger,
+        status="completed",
+        elapsed_sec=elapsed,
+        progress=shutdown.progress,
+    )
     return 0
 
 
@@ -155,20 +197,94 @@ if __name__ == "__main__":
     worker_logger = global_worker_logger
     tee_handle = enable_stdout_tee(log_path)
 
+    shutdown = ShutdownController()
+    lock_fd: int | None = None
+    started = time.time()
     status = "completed"
     exit_code = 0
+    failure_reason: str | None = None
+
     try:
-        exit_code = main(args)
-    except Exception as exc:
+        running_pid = existing_worker_pid(PID_FILE)
+        if running_pid is not None and running_pid != os.getpid():
+            status = "refused"
+            failure_reason = f"already_running pid={running_pid}"
+            exit_code = 1
+            log_run_summary(
+                worker_logger,
+                status=status,
+                reason=failure_reason,
+                elapsed_sec=0,
+                exit_code=exit_code,
+            )
+            raise SystemExit(exit_code)
+
+        lock_fd = acquire_instance_lock(LOCK_FILE)
+        if lock_fd is None:
+            status = "refused"
+            failure_reason = "instance_lock_busy"
+            exit_code = 1
+            log_run_summary(
+                worker_logger,
+                status=status,
+                reason=failure_reason,
+                elapsed_sec=0,
+                exit_code=exit_code,
+            )
+            raise SystemExit(exit_code)
+
+        write_pid_file(PID_FILE)
+        exit_code = run_worker(args, shutdown)
+        if shutdown.is_requested():
+            status = "interrupted"
+            failure_reason = shutdown.reason
+        else:
+            status = "completed"
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            if status == "completed":
+                status = "failed"
+                failure_reason = f"exit_code={exc.code}"
+            exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+        raise
+    except KeyboardInterrupt:
+        shutdown.request_shutdown("signal:KeyboardInterrupt")
+        status = "interrupted"
+        failure_reason = shutdown.reason
+        exit_code = 130
+        log_run_summary(
+            worker_logger,
+            status=status,
+            reason=failure_reason,
+            elapsed_sec=time.time() - started,
+            progress=shutdown.progress,
+            exit_code=exit_code,
+        )
+        raise SystemExit(exit_code)
+    except BaseException as exc:
         status = "failed"
+        failure_reason = str(exc)
         exit_code = 1
         worker_logger.exception("RUN_SUMMARY | status=failed | error=%s", exc)
+        log_run_summary(
+            worker_logger,
+            status=status,
+            reason=failure_reason,
+            elapsed_sec=time.time() - started,
+            progress=shutdown.progress,
+            exit_code=exit_code,
+        )
         print(f"Fatal error: {exc}")
         raise
     finally:
         worker_logger.info(
-            "[LOG] Execution end: run_resilient_sheet.py | status=%s",
+            "[LOG] Execution end: run_resilient_sheet.py | status=%s | reason=%s",
             status,
+            failure_reason or shutdown.reason or "none",
         )
+        remove_pid_file(PID_FILE)
+        release_instance_lock(lock_fd)
+        flush_log_handlers()
         disable_stdout_tee(tee_handle)
+
     raise SystemExit(exit_code)

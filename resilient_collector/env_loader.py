@@ -6,6 +6,10 @@ from pathlib import Path
 
 def _clean_value(value: str) -> str:
     value = value.strip()
+    if value and value[0] not in {"'", '"'}:
+        hash_at = value.find(" #")
+        if hash_at >= 0:
+            value = value[:hash_at].rstrip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value

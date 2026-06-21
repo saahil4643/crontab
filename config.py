@@ -23,6 +23,10 @@ def _bootstrap_env() -> None:
         if not key or key in os.environ:
             continue
         cleaned = value.strip()
+        if cleaned and cleaned[0] not in {"'", '"'}:
+            hash_at = cleaned.find(" #")
+            if hash_at >= 0:
+                cleaned = cleaned[:hash_at].rstrip()
         if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
             cleaned = cleaned[1:-1]
         os.environ[key] = cleaned
@@ -40,6 +44,13 @@ def _env_int(name: str, default: int) -> int:
     if not raw:
         return default
     return int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if not raw:
+        return default
+    return float(raw)
 
 
 def _require_env(name: str) -> str:

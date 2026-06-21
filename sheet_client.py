@@ -164,3 +164,16 @@ class DcfSheetClient:
             job.ticker,
             job.current_value,
         )
+
+    def apply_cell_updates(self, updates: list) -> None:
+        """Apply cell updates in one batch_update call (items need .job and .value)."""
+        if not updates:
+            return
+        payload = [
+            {
+                "range": f"{update.job.value_col}{update.job.row}",
+                "values": [[update.value]],
+            }
+            for update in updates
+        ]
+        self._worksheet.batch_update(payload, value_input_option="USER_ENTERED")

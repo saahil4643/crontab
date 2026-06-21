@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
+from pathlib import Path
+
 from config import SourceKey, USER_AGENT
 from logging_setup import setup_logging
 from models import ScrapeJob
@@ -27,8 +29,13 @@ from resilient_collector.proxy_pool import ProxyConfig, build_validated_pool
 from scrapers.extract import format_for_sheet
 from sheet_client import DcfSheetClient
 from sheet_utils import has_stored_cell_value
+from sheet_write_buffer import SheetWriteBuffer
+from worker_shutdown import ShutdownController, interruptible_sleep
 
 logger = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).resolve().parent.parent
+_PENDING_WRITES_PATH = _ROOT / "logs" / "pending_sheet_writes.jsonl"
 
 BASELINE_SLEEP_SECONDS = int(os.environ.get("RESILIENT_SLEEP_BASELINE_SECONDS", "8"))
 GURUFOCUS_SLEEP_SECONDS = int(os.environ.get("RESILIENT_GURUFOCUS_SLEEP_SECONDS", "90"))
@@ -130,10 +137,14 @@ def compliance_sleep_seconds(source: SourceKey | None = None) -> int:
     return random.randint(max(0, BASELINE_SLEEP_SECONDS - JITTER_SECONDS), BASELINE_SLEEP_SECONDS + JITTER_SECONDS)
 
 
-async def compliance_sleep(source: SourceKey | None = None) -> None:
+async def compliance_sleep(
+    source: SourceKey | None = None,
+    shutdown: ShutdownController | None = None,
+) -> bool:
+    """Pause between jobs. Returns False if shutdown was requested during the wait."""
     delay = compliance_sleep_seconds(source)
     logger.info("[schedule] Post-request pause: %d seconds", delay)
-    await asyncio.sleep(delay)
+    return await interruptible_sleep(delay, shutdown, label="Post-request pause")
 
 
 async def create_isolated_context(
@@ -434,6 +445,8 @@ async def _process_valueinvesting_with_session(
 async def process_valueinvesting_jobs(
     jobs: list[ScrapeJob],
     proxy_pool: list[ProxyConfig],
+    *,
+    shutdown: ShutdownController | None = None,
 ) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
     """Scrape each VI job in a shared browser session; yield after each ticker for immediate sheet writes."""
     if not jobs:
@@ -444,6 +457,27 @@ async def process_valueinvesting_jobs(
 
     try:
         for index, job in enumerate(jobs, start=1):
+            if shutdown is not None and shutdown.is_requested():
+                logger.warning(
+                    "[sheet] Shutdown during ValueInvesting batch at VI %d/%d | row=%d ticker=%s col=%s",
+                    index - 1,
+                    total,
+                    shutdown.progress.last_row or job.row,
+                    shutdown.progress.last_ticker or job.ticker,
+                    job.value_col,
+                )
+                break
+
+            if shutdown is not None:
+                shutdown.note_job(
+                    row=job.row,
+                    ticker=job.ticker,
+                    source=job.source,
+                    batch="ValueInvesting",
+                    batch_index=index,
+                    batch_total=total,
+                )
+
             logger.info(
                 "[sheet] Processing row=%d ticker=%s source=valueinvesting col=%s (VI %d/%d)",
                 job.row,
@@ -462,13 +496,29 @@ async def process_valueinvesting_jobs(
                 result.error,
             )
             yield job, result
+            if shutdown is not None:
+                shutdown.note_job_completed()
+
             if index < total:
-                await compliance_sleep("valueinvesting")  # anti-throttle between tickers
+                if not await compliance_sleep("valueinvesting", shutdown):
+                    logger.warning(
+                        "[sheet] Shutdown during ValueInvesting post-request pause at VI %d/%d | row=%d ticker=%s",
+                        index,
+                        total,
+                        job.row,
+                        job.ticker,
+                    )
+                    break
     finally:
         await session.close()
 
 
-async def _clear_stale_cell(client: DcfSheetClient, job: ScrapeJob, *, reason: str) -> bool:
+async def _clear_stale_cell(
+    writes: SheetWriteBuffer,
+    job: ScrapeJob,
+    *,
+    reason: str,
+) -> bool:
     if not has_stored_cell_value(job.current_value):
         logger.info(
             "[sheet] row=%d col=%s ticker=%s already empty (%s)",
@@ -478,7 +528,7 @@ async def _clear_stale_cell(client: DcfSheetClient, job: ScrapeJob, *, reason: s
             reason,
         )
         return False
-    await retry_sync("clear_value", client.clear_value, job)
+    await writes.enqueue_clear(job)
     logger.info(
         "[sheet] Cleared row=%d col=%s ticker=%s old=%r reason=%s",
         job.row,
@@ -490,10 +540,10 @@ async def _clear_stale_cell(client: DcfSheetClient, job: ScrapeJob, *, reason: s
     return True
 
 
-async def _apply_clear_only_job(client: DcfSheetClient, job: ScrapeJob) -> SheetJobResult:
+async def _apply_clear_only_job(writes: SheetWriteBuffer, job: ScrapeJob) -> SheetJobResult:
     index_hint = job.index_label or job.security_type
     cleared = await _clear_stale_cell(
-        client,
+        writes,
         job,
         reason=f"non-US index {index_hint!r}",
     )
@@ -501,18 +551,18 @@ async def _apply_clear_only_job(client: DcfSheetClient, job: ScrapeJob) -> Sheet
 
 
 async def _apply_job_result(
-    client: DcfSheetClient,
+    writes: SheetWriteBuffer,
     job: ScrapeJob,
     result: TickerResult,
 ) -> SheetJobResult:
     if job.clear_only:
-        return await _apply_clear_only_job(client, job)
+        return await _apply_clear_only_job(writes, job)
 
     written = False
     if result.success and result.metric:
         value = format_for_sheet(result.metric)
         if value.strip():
-            await retry_sync("write_value", client.write_value, job, value)
+            await writes.enqueue_write(job, value)
             written = True
             logger.info(
                 "[sheet] Wrote row=%d col=%s ticker=%s old=%r value=%s source=%s",
@@ -523,7 +573,7 @@ async def _apply_job_result(
                 value,
                 result.source,
             )
-        elif await _clear_stale_cell(client, job, reason="normalized scrape result empty"):
+        elif await _clear_stale_cell(writes, job, reason="normalized scrape result empty"):
             written = True
         else:
             logger.warning(
@@ -532,7 +582,7 @@ async def _apply_job_result(
                 job.value_col,
                 job.ticker,
             )
-    elif await _clear_stale_cell(client, job, reason=result.error or "scrape failed"):
+    elif await _clear_stale_cell(writes, job, reason=result.error or "scrape failed"):
         written = True
     else:
         logger.info(
@@ -550,9 +600,12 @@ async def run_sheet_collector(
     dry_run: bool = False,
     limit: int | None = None,
     sources: set[SourceKey] | None = None,
+    shutdown: ShutdownController | None = None,
 ) -> list[SheetJobResult]:
     load_env_file()
     client = DcfSheetClient()
+    writes = SheetWriteBuffer(client, pending_path=_PENDING_WRITES_PATH)
+    await writes.replay_pending_file()
     jobs = _filter_sheet_jobs(await retry_sync("collect_jobs", client.collect_jobs), sources, limit)
     if not jobs:
         logger.info("[sheet] Nothing to process")
@@ -581,6 +634,9 @@ async def run_sheet_collector(
             job.clear_only,
         )
 
+    if shutdown is not None:
+        shutdown.progress.total_jobs = len(jobs)
+
     if dry_run:
         return [SheetJobResult(job=job, result=None, written=False) for job in jobs]
 
@@ -588,44 +644,88 @@ async def run_sheet_collector(
     results: list[SheetJobResult] = []
     job_cache: dict[tuple[str, SourceKey], TickerResult] = {}
 
-    for job in clear_jobs:
-        results.append(await _apply_clear_only_job(client, job))
+    try:
+        for job in clear_jobs:
+            if shutdown is not None and shutdown.is_requested():
+                break
+            if shutdown is not None:
+                shutdown.note_job(row=job.row, ticker=job.ticker, source=job.source, batch="clear")
+            results.append(await _apply_clear_only_job(writes, job))
+            if shutdown is not None:
+                shutdown.note_job_completed()
 
-    vi_jobs, other_jobs = _partition_valueinvesting_jobs(scrape_jobs)
-    if vi_jobs:
-        logger.info(
-            "[sheet] ValueInvesting batch: %d jobs (shared browser, rotate identity every %s views)",
-            len(vi_jobs),
-            os.environ.get("RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY", "5"),
-        )
-        async for job, result in process_valueinvesting_jobs(vi_jobs, proxy_pool):
-            job_cache[(job.ticker, job.source)] = result
-            results.append(await _apply_job_result(client, job, result))
+        vi_jobs, other_jobs = _partition_valueinvesting_jobs(scrape_jobs)
+        if vi_jobs and not (shutdown is not None and shutdown.is_requested()):
+            logger.info(
+                "[sheet] ValueInvesting batch: %d jobs (shared browser, rotate identity every %s views)",
+                len(vi_jobs),
+                os.environ.get("RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY", "5"),
+            )
+            async for job, result in process_valueinvesting_jobs(
+                vi_jobs, proxy_pool, shutdown=shutdown
+            ):
+                if shutdown is not None and shutdown.is_requested():
+                    break
+                job_cache[(job.ticker, job.source)] = result
+                results.append(await _apply_job_result(writes, job, result))
 
-    total_other = len(other_jobs)
-    for index, job in enumerate(other_jobs, start=1):
-        logger.info(
-            "[sheet] Processing row=%d ticker=%s source=%s col=%s (%d/%d)",
-            job.row,
-            job.ticker,
-            job.source,
-            job.value_col,
-            index,
-            total_other,
-        )
+        total_other = len(other_jobs)
+        for index, job in enumerate(other_jobs, start=1):
+            if shutdown is not None and shutdown.is_requested():
+                logger.warning(
+                    "[sheet] Shutdown during scrape jobs at %d/%d | last row=%d ticker=%s source=%s",
+                    index - 1,
+                    total_other,
+                    shutdown.progress.last_row or job.row,
+                    shutdown.progress.last_ticker or job.ticker,
+                    shutdown.progress.last_source or job.source,
+                )
+                break
 
-        cache_key = (job.ticker, job.source)
-        if cache_key in job_cache:
-            result = job_cache[cache_key]
-            logger.info("[sheet] Reusing cached result for %s %s", job.ticker, job.source)
-        else:
-            result = await process_job(job, proxy_pool)
-            job_cache[cache_key] = result
+            if shutdown is not None:
+                shutdown.note_job(
+                    row=job.row,
+                    ticker=job.ticker,
+                    source=job.source,
+                    batch="scrape",
+                    batch_index=index,
+                    batch_total=total_other,
+                )
 
-        results.append(await _apply_job_result(client, job, result))
+            logger.info(
+                "[sheet] Processing row=%d ticker=%s source=%s col=%s (%d/%d)",
+                job.row,
+                job.ticker,
+                job.source,
+                job.value_col,
+                index,
+                total_other,
+            )
 
-        if index < total_other:
-            await compliance_sleep(job.source)
+            cache_key = (job.ticker, job.source)
+            if cache_key in job_cache:
+                result = job_cache[cache_key]
+                logger.info("[sheet] Reusing cached result for %s %s", job.ticker, job.source)
+            else:
+                result = await process_job(job, proxy_pool)
+                job_cache[cache_key] = result
+
+            results.append(await _apply_job_result(writes, job, result))
+            if shutdown is not None:
+                shutdown.note_job_completed()
+
+            if index < total_other:
+                if not await compliance_sleep(job.source, shutdown):
+                    logger.warning(
+                        "[sheet] Shutdown during post-request pause at %d/%d | row=%d ticker=%s",
+                        index,
+                        total_other,
+                        job.row,
+                        job.ticker,
+                    )
+                    break
+    finally:
+        await writes.close()
 
     return results
 
