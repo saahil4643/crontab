@@ -28,6 +28,7 @@ from config import (
     YAHOO_QUOTE_URL,
 )
 from models import ScrapeJob
+from resilient_collector.nav_retry import goto_with_retry
 from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from scrapers.extract import extract_from_json_payloads, extract_from_text, normalize_numeric_string
 
@@ -289,7 +290,14 @@ async def _navigate_collect(
         "Accept-Language": "en-US,en;q=0.9",
         "User-Agent": USER_AGENT,
     })
-    response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    response = await goto_with_retry(
+        page,
+        url,
+        ticker=ticker,
+        label=source_label,
+        wait_until="domcontentloaded",
+        timeout_ms=timeout,
+    )
     if response is None:
         raise RuntimeError(f"{source_label} returned no response")
     status = response.status
@@ -506,7 +514,14 @@ async def extract_valueinvesting_metric(page: Page, job: ScrapeJob) -> PrimaryEx
                 "Accept-Language": "en-US,en;q=0.9",
                 "User-Agent": USER_AGENT,
             })
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=DIRECT_TIMEOUT_MS)
+            response = await goto_with_retry(
+                page,
+                url,
+                ticker=ticker,
+                label="ValueInvesting",
+                wait_until="domcontentloaded",
+                timeout_ms=DIRECT_TIMEOUT_MS,
+            )
             if response is None:
                 raise RuntimeError("ValueInvesting returned no response")
             status = response.status
@@ -611,10 +626,13 @@ async def _extract_gurufocus(page: Page, job: ScrapeJob) -> PrimaryExtractionRes
         "Accept-Language": "en-US,en;q=0.9",
         "User-Agent": USER_AGENT,
     })
-    response = await page.goto(
+    response = await goto_with_retry(
+        page,
         url,
+        ticker=ticker,
+        label="GuruFocus",
         wait_until="domcontentloaded",
-        timeout=DIRECT_TIMEOUT_MS,
+        timeout_ms=DIRECT_TIMEOUT_MS,
     )
     if response is None:
         raise RuntimeError("No response from primary navigation")
@@ -750,7 +768,14 @@ async def extract_google_fallback_metric_for_job(page: Page, job: ScrapeJob) -> 
         "Accept-Language": "en-US,en;q=0.9",
         "User-Agent": USER_AGENT,
     })
-    await page.goto(search_url, wait_until="domcontentloaded", timeout=SERP_TIMEOUT_MS)
+    await goto_with_retry(
+        page,
+        search_url,
+        ticker=job.ticker,
+        label="Google fallback",
+        wait_until="domcontentloaded",
+        timeout_ms=SERP_TIMEOUT_MS,
+    )
     try:
         await _dismiss_overlays(page)
     except Exception:

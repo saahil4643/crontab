@@ -25,6 +25,12 @@ from resilient_collector.extractors import (
 from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from resilient_collector.valueinvesting_session import ValueInvestingSession
 from resilient_collector.env_loader import load_env_file
+from resilient_collector.nav_retry import (
+    interruptible_sleep_seconds,
+    is_retryable_primary_failure,
+    is_transient_nav_error,
+    scrape_nav_retry_base_seconds,
+)
 from resilient_collector.proxy_pool import ProxyConfig, build_validated_pool
 from scrapers.extract import format_for_sheet
 from sheet_client import DcfSheetClient
@@ -45,8 +51,24 @@ VALUEINVESTING_SLEEP_JITTER_SECONDS = int(
     os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", "10")
 )
 JITTER_SECONDS = int(os.environ.get("RESILIENT_SLEEP_JITTER_SECONDS", "0"))
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 SHEET_RETRY_ATTEMPTS = int(os.environ.get("SHEET_RETRY_ATTEMPTS", "6"))
 SHEET_RETRY_BASE_SECONDS = float(os.environ.get("SHEET_RETRY_BASE_SECONDS", "2"))
+SCRAPE_PRIMARY_RETRY_ATTEMPTS = max(
+    1, int(os.environ.get("RESILIENT_SCRAPE_PRIMARY_RETRY_ATTEMPTS", "2"))
+)
+VALUEINVESTING_FAILED_REPLAY = env_bool("RESILIENT_VALUEINVESTING_FAILED_REPLAY", True)
+VALUEINVESTING_REPLAY_PAUSE_SECONDS = int(
+    os.environ.get("RESILIENT_VALUEINVESTING_REPLAY_PAUSE_SECONDS", "60")
+)
 DEFAULT_TICKERS = ("AAPL", "MSFT")
 SHEET_SOURCES: set[SourceKey] = {
     "alphaspread",
@@ -58,13 +80,6 @@ SHEET_SOURCES: set[SourceKey] = {
 }
 
 
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def browser_headless() -> bool:
     return env_bool("RESILIENT_HEADLESS", False)
 
@@ -73,6 +88,8 @@ async def _run_page_fallback_chain(
     page: Page,
     job: ScrapeJob,
     proxy_label: str,
+    *,
+    transient_primary: bool = False,
 ) -> TickerResult:
     """Google search fallback after primary scrape failure."""
     try:
@@ -85,6 +102,7 @@ async def _run_page_fallback_chain(
             source="fallbacks",
             proxy=proxy_label,
             error=str(google_exc),
+            transient=transient_primary or is_transient_nav_error(google_exc),
         )
 
     if google_result.metric:
@@ -102,6 +120,7 @@ async def _run_page_fallback_chain(
         source="fallbacks",
         proxy=proxy_label,
         error="Google fallback completed but no metric was found",
+        transient=transient_primary,
     )
 
 
@@ -114,6 +133,7 @@ class TickerResult:
     proxy: str | None = None
     error: str | None = None
     confidence: str | None = None
+    transient: bool = False
 
 
 @dataclass
@@ -322,7 +342,12 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                     job.source,
                     primary_exc,
                 )
-                return await _run_page_fallback_chain(page, job, proxy.label)
+                return await _run_page_fallback_chain(
+                    page,
+                    job,
+                    proxy.label,
+                    transient_primary=is_retryable_primary_failure(primary_exc),
+                )
 
     except Exception as exc:
         logger.error("[%s] %s unrecoverable error: %s", job.ticker, job.source, exc)
@@ -406,40 +431,72 @@ async def _process_valueinvesting_with_session(
             proxy=proxy_label,
         )
 
-    try:
-        return await _scrape_once()
-    except ValueInvestingLimitError as limit_exc:
-        session.record_view()
-        logger.warning(
-            "[%s] ValueInvesting view limit (%s); rotating browser identity",
-            job.ticker,
-            limit_exc,
-        )
-        if not allow_retry_on_limit:
-            session.record_view()
-            page = await session.ensure_page()
-            return await _run_page_fallback_chain(page, job, proxy_label)
-        await session.rotate_identity()
+    last_primary_exc: Exception | None = None
+    for primary_attempt in range(1, SCRAPE_PRIMARY_RETRY_ATTEMPTS + 1):
         try:
             return await _scrape_once()
-        except Exception as retry_exc:
-            logger.warning(
-                "[%s] valueinvesting retry failed (%s); trying fallbacks",
-                job.ticker,
-                retry_exc,
-            )
+        except ValueInvestingLimitError as limit_exc:
             session.record_view()
-            page = await session.ensure_page()
-            return await _run_page_fallback_chain(page, job, proxy_label)
-    except Exception as exc:
-        logger.warning(
-            "[%s] valueinvesting primary failed (%s); trying fallbacks",
-            job.ticker,
-            exc,
-        )
-        session.record_view()
-        page = await session.ensure_page()
-        return await _run_page_fallback_chain(page, job, proxy_label)
+            logger.warning(
+                "[%s] ValueInvesting view limit (%s); rotating browser identity",
+                job.ticker,
+                limit_exc,
+            )
+            if not allow_retry_on_limit:
+                session.record_view()
+                page = await session.ensure_page()
+                return await _run_page_fallback_chain(page, job, proxy_label)
+            await session.rotate_identity()
+            try:
+                return await _scrape_once()
+            except Exception as retry_exc:
+                logger.warning(
+                    "[%s] valueinvesting retry failed (%s); trying fallbacks",
+                    job.ticker,
+                    retry_exc,
+                )
+                session.record_view()
+                page = await session.ensure_page()
+                return await _run_page_fallback_chain(
+                    page,
+                    job,
+                    proxy_label,
+                    transient_primary=is_retryable_primary_failure(retry_exc),
+                )
+        except Exception as exc:
+            last_primary_exc = exc
+            if (
+                primary_attempt < SCRAPE_PRIMARY_RETRY_ATTEMPTS
+                and is_retryable_primary_failure(exc)
+            ):
+                delay = scrape_nav_retry_base_seconds() * primary_attempt
+                logger.warning(
+                    "[%s] valueinvesting primary attempt %d/%d failed (%s); "
+                    "retrying primary in %.1fs",
+                    job.ticker,
+                    primary_attempt,
+                    SCRAPE_PRIMARY_RETRY_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+
+    assert last_primary_exc is not None
+    logger.warning(
+        "[%s] valueinvesting primary failed (%s); trying fallbacks",
+        job.ticker,
+        last_primary_exc,
+    )
+    session.record_view()
+    page = await session.ensure_page()
+    return await _run_page_fallback_chain(
+        page,
+        job,
+        proxy_label,
+        transient_primary=is_retryable_primary_failure(last_primary_exc),
+    )
 
 
 async def process_valueinvesting_jobs(
@@ -454,6 +511,44 @@ async def process_valueinvesting_jobs(
 
     session = ValueInvestingSession(proxy_pool)
     total = len(jobs)
+    failed_for_replay: list[ScrapeJob] = []
+
+    async def _run_one(index: int, job: ScrapeJob, *, replay: bool) -> TickerResult | None:
+        if shutdown is not None and shutdown.is_requested():
+            return None
+
+        if shutdown is not None:
+            batch_label = "ValueInvesting-replay" if replay else "ValueInvesting"
+            shutdown.note_job(
+                row=job.row,
+                ticker=job.ticker,
+                source=job.source,
+                batch=batch_label,
+                batch_index=index,
+                batch_total=total,
+            )
+
+        phase = "replay" if replay else "VI"
+        logger.info(
+            "[sheet] Processing row=%d ticker=%s source=valueinvesting col=%s (%s %d/%d)",
+            job.row,
+            job.ticker,
+            job.value_col,
+            phase,
+            index,
+            total,
+        )
+        result = await _process_valueinvesting_with_session(job, session)
+        logger.info(
+            "[result] ticker=%s success=%s source=%s metric=%s error=%s transient=%s",
+            result.ticker,
+            result.success,
+            result.source,
+            result.metric,
+            result.error,
+            result.transient,
+        )
+        return result
 
     try:
         for index, job in enumerate(jobs, start=1):
@@ -468,36 +563,16 @@ async def process_valueinvesting_jobs(
                 )
                 break
 
-            if shutdown is not None:
-                shutdown.note_job(
-                    row=job.row,
-                    ticker=job.ticker,
-                    source=job.source,
-                    batch="ValueInvesting",
-                    batch_index=index,
-                    batch_total=total,
-                )
+            result = await _run_one(index, job, replay=False)
+            if result is None:
+                break
 
-            logger.info(
-                "[sheet] Processing row=%d ticker=%s source=valueinvesting col=%s (VI %d/%d)",
-                job.row,
-                job.ticker,
-                job.value_col,
-                index,
-                total,
-            )
-            result = await _process_valueinvesting_with_session(job, session)
-            logger.info(
-                "[result] ticker=%s success=%s source=%s metric=%s error=%s",
-                result.ticker,
-                result.success,
-                result.source,
-                result.metric,
-                result.error,
-            )
             yield job, result
             if shutdown is not None:
                 shutdown.note_job_completed()
+
+            if not result.success and result.transient:
+                failed_for_replay.append(job)
 
             if index < total:
                 if not await compliance_sleep("valueinvesting", shutdown):
@@ -509,6 +584,40 @@ async def process_valueinvesting_jobs(
                         job.ticker,
                     )
                     break
+
+        if (
+            failed_for_replay
+            and VALUEINVESTING_FAILED_REPLAY
+            and not (shutdown is not None and shutdown.is_requested())
+        ):
+            logger.info(
+                "[sheet] ValueInvesting replay pass: %d transient failure(s) after initial batch",
+                len(failed_for_replay),
+            )
+            if VALUEINVESTING_REPLAY_PAUSE_SECONDS > 0:
+                logger.info(
+                    "[sheet] ValueInvesting replay throttle pause: %d seconds",
+                    VALUEINVESTING_REPLAY_PAUSE_SECONDS,
+                )
+                if not await interruptible_sleep_seconds(
+                    VALUEINVESTING_REPLAY_PAUSE_SECONDS,
+                    shutdown,
+                ):
+                    logger.warning("[sheet] Shutdown during ValueInvesting replay throttle pause")
+                    return
+
+            for replay_index, job in enumerate(failed_for_replay, start=1):
+                if shutdown is not None and shutdown.is_requested():
+                    break
+                result = await _run_one(replay_index, job, replay=True)
+                if result is None:
+                    break
+                yield job, result
+                if shutdown is not None:
+                    shutdown.note_job_completed()
+                if replay_index < len(failed_for_replay):
+                    if not await compliance_sleep("valueinvesting", shutdown):
+                        break
     finally:
         await session.close()
 
@@ -582,6 +691,15 @@ async def _apply_job_result(
                 job.value_col,
                 job.ticker,
             )
+    elif result.transient and has_stored_cell_value(job.current_value):
+        logger.info(
+            "[sheet] Keeping stale row=%d col=%s ticker=%s value=%r after transient error=%s",
+            job.row,
+            job.value_col,
+            job.ticker,
+            job.current_value,
+            result.error,
+        )
     elif await _clear_stale_cell(writes, job, reason=result.error or "scrape failed"):
         written = True
     else:
