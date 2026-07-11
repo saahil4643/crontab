@@ -18,11 +18,13 @@ from models import ScrapeJob
 from resilient_collector.extractors import (
     extract_google_fallback_metric,
     extract_google_fallback_metric_for_job,
+    extract_gurufocus_metric,
     extract_primary_metric,
     extract_primary_metric_for_job,
     extract_valueinvesting_metric,
 )
 from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
+from resilient_collector.gurufocus_session import GuruFocusSession
 from resilient_collector.valueinvesting_session import ValueInvestingSession
 from resilient_collector.env_loader import load_env_file
 from resilient_collector.nav_retry import (
@@ -411,6 +413,163 @@ def _partition_valueinvesting_jobs(jobs: list[ScrapeJob]) -> tuple[list[ScrapeJo
     return vi_jobs, other_jobs
 
 
+def _partition_gurufocus_jobs(jobs: list[ScrapeJob]) -> tuple[list[ScrapeJob], list[ScrapeJob]]:
+    gf_jobs = [job for job in jobs if job.source == "gurufocus"]
+    other_jobs = [job for job in jobs if job.source != "gurufocus"]
+    return gf_jobs, other_jobs
+
+
+def _is_gurufocus_block_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "restrictive or unstable status: 403" in msg or "restrictive or unstable status: 429" in msg
+
+
+async def _process_gurufocus_with_session(
+    job: ScrapeJob,
+    session: GuruFocusSession,
+) -> TickerResult:
+    proxy_label = session.proxy_label
+
+    async def _scrape_once() -> TickerResult:
+        page = await session.ensure_page()
+        primary = await extract_gurufocus_metric(page, job)
+        session.record_view()
+        return TickerResult(
+            ticker=job.ticker,
+            success=True,
+            source=f"primary_{primary.method}",
+            metric=primary.metric,
+            proxy=session.proxy_label,
+        )
+
+    last_primary_exc: Exception | None = None
+    rotated_for_block = False
+    for primary_attempt in range(1, SCRAPE_PRIMARY_RETRY_ATTEMPTS + 1):
+        try:
+            return await _scrape_once()
+        except Exception as exc:
+            last_primary_exc = exc
+            if _is_gurufocus_block_error(exc) and not rotated_for_block:
+                rotated_for_block = True
+                logger.warning(
+                    "[%s] GuruFocus blocked (%s); rotating browser identity and retrying",
+                    job.ticker,
+                    exc,
+                )
+                session.record_view()
+                await session.rotate_identity()
+                try:
+                    return await _scrape_once()
+                except Exception as retry_exc:
+                    last_primary_exc = retry_exc
+                    break
+            if (
+                primary_attempt < SCRAPE_PRIMARY_RETRY_ATTEMPTS
+                and is_retryable_primary_failure(exc)
+            ):
+                delay = scrape_nav_retry_base_seconds() * primary_attempt
+                logger.warning(
+                    "[%s] gurufocus primary attempt %d/%d failed (%s); "
+                    "retrying primary in %.1fs",
+                    job.ticker,
+                    primary_attempt,
+                    SCRAPE_PRIMARY_RETRY_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+
+    assert last_primary_exc is not None
+    logger.warning(
+        "[%s] gurufocus primary failed (%s); trying fallbacks",
+        job.ticker,
+        last_primary_exc,
+    )
+    session.record_view()
+    page = await session.ensure_page()
+    return await _run_page_fallback_chain(
+        page,
+        job,
+        session.proxy_label or proxy_label,
+        transient_primary=_is_gurufocus_block_error(last_primary_exc)
+        or is_retryable_primary_failure(last_primary_exc),
+    )
+
+
+async def process_gurufocus_jobs(
+    jobs: list[ScrapeJob],
+    proxy_pool: list[ProxyConfig],
+    *,
+    shutdown: ShutdownController | None = None,
+) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    """Scrape GuruFocus jobs in a shared browser session; yield after each ticker."""
+    if not jobs:
+        return
+
+    session = GuruFocusSession(proxy_pool)
+    total = len(jobs)
+
+    try:
+        for index, job in enumerate(jobs, start=1):
+            if shutdown is not None and shutdown.is_requested():
+                logger.warning(
+                    "[sheet] Shutdown during GuruFocus batch at GF %d/%d | row=%d ticker=%s col=%s",
+                    index - 1,
+                    total,
+                    shutdown.progress.last_row or job.row,
+                    shutdown.progress.last_ticker or job.ticker,
+                    job.value_col,
+                )
+                break
+
+            if shutdown is not None:
+                shutdown.note_job(
+                    row=job.row,
+                    ticker=job.ticker,
+                    source=job.source,
+                    batch="GuruFocus",
+                    batch_index=index,
+                    batch_total=total,
+                )
+
+            logger.info(
+                "[sheet] Processing row=%d ticker=%s source=gurufocus col=%s (GF %d/%d)",
+                job.row,
+                job.ticker,
+                job.value_col,
+                index,
+                total,
+            )
+            result = await _process_gurufocus_with_session(job, session)
+            logger.info(
+                "[result] ticker=%s success=%s source=%s metric=%s error=%s transient=%s",
+                result.ticker,
+                result.success,
+                result.source,
+                result.metric,
+                result.error,
+                result.transient,
+            )
+            yield job, result
+            if shutdown is not None:
+                shutdown.note_job_completed()
+
+            if index < total:
+                if not await compliance_sleep("gurufocus", shutdown):
+                    logger.warning(
+                        "[sheet] Shutdown during GuruFocus post-request pause at GF %d/%d | row=%d ticker=%s",
+                        index,
+                        total,
+                        job.row,
+                        job.ticker,
+                    )
+                    break
+    finally:
+        await session.close()
+
+
 async def _process_valueinvesting_with_session(
     job: ScrapeJob,
     session: ValueInvestingSession,
@@ -781,6 +940,21 @@ async def run_sheet_collector(
             )
             async for job, result in process_valueinvesting_jobs(
                 vi_jobs, proxy_pool, shutdown=shutdown
+            ):
+                if shutdown is not None and shutdown.is_requested():
+                    break
+                job_cache[(job.ticker, job.source)] = result
+                results.append(await _apply_job_result(writes, job, result))
+
+        gf_jobs, other_jobs = _partition_gurufocus_jobs(other_jobs)
+        if gf_jobs and not (shutdown is not None and shutdown.is_requested()):
+            logger.info(
+                "[sheet] GuruFocus batch: %d jobs (shared browser, rotate identity every %s views)",
+                len(gf_jobs),
+                os.environ.get("RESILIENT_GURUFOCUS_VIEWS_PER_IDENTITY", "15"),
+            )
+            async for job, result in process_gurufocus_jobs(
+                gf_jobs, proxy_pool, shutdown=shutdown
             ):
                 if shutdown is not None and shutdown.is_requested():
                     break

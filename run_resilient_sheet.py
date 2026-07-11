@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from contextlib import suppress
 from pathlib import Path
 
@@ -33,6 +35,7 @@ JOB_NAME = ROOT.name
 LOG_DIR = ROOT / "logs"
 PID_FILE = LOG_DIR / "resilient_sheet_run.pid"
 LOCK_FILE = LOG_DIR / "resilient_sheet_run.lock"
+PHASE_RESULT_FILE = LOG_DIR / "worker_phase_result.json"
 XVFB_MARKER = "RESILIENT_XVFB_ACTIVE"
 
 from job_logging_import import get_job_logging
@@ -102,6 +105,21 @@ def maybe_reexec_with_xvfb(args: argparse.Namespace) -> None:
 
 def worker_log_path() -> str:
     return daily_log_path(JOB_NAME, str(LOG_DIR), role="worker")
+
+
+def write_phase_result(*, phase: str, status: str, reason: str | None, exit_code: int) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "phase": phase,
+        "status": status,
+        "reason": reason,
+        "exit_code": exit_code,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+    }
+    tmp_path = PHASE_RESULT_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(PHASE_RESULT_FILE)
 
 
 def start_background(argv: list[str]) -> int:
@@ -206,7 +224,13 @@ if __name__ == "__main__":
 
     try:
         running_pid = existing_worker_pid(PID_FILE)
-        if running_pid is not None and running_pid != os.getpid():
+        # Background + xvfb writes the launcher PID first; the real worker is a child
+        # of that process, so treat parent PID as "us", not a competing instance.
+        if (
+            running_pid is not None
+            and running_pid != os.getpid()
+            and running_pid != os.getppid()
+        ):
             status = "refused"
             failure_reason = f"already_running pid={running_pid}"
             exit_code = 1
@@ -282,6 +306,14 @@ if __name__ == "__main__":
             status,
             failure_reason or shutdown.reason or "none",
         )
+        cycle_phase = os.environ.get("RESILIENT_CYCLE_PHASE", "").strip()
+        if cycle_phase:
+            write_phase_result(
+                phase=cycle_phase,
+                status=status,
+                reason=failure_reason or shutdown.reason,
+                exit_code=exit_code,
+            )
         remove_pid_file(PID_FILE)
         release_instance_lock(lock_fd)
         flush_log_handlers()

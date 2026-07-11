@@ -92,6 +92,15 @@ VALUE_INVESTING_VALUATION_URL = _env(
     "VALUE_INVESTING_VALUATION_URL_TEMPLATE",
     "https://valueinvesting.io/{ticker}/valuation/{path}",
 )
+GURUFOCUS_HOME_URL = _env(
+    "GURUFOCUS_HOME_URL",
+    "https://www.gurufocus.com/",
+)
+GURUFOCUS_DCF_URL = _env(
+    "GURUFOCUS_DCF_URL_TEMPLATE",
+    "https://www.gurufocus.com/stock/{ticker}/dcf?search={ticker}",
+)
+# Legacy term page kept as fallback when DCF page does not yield Fair Value.
 GURUFOCUS_EARNINGS_TERM_URL = _env(
     "GURUFOCUS_URL_TEMPLATE",
     "https://www.gurufocus.com/term/intrinsic-value-dcf-earnings-based/{ticker}",

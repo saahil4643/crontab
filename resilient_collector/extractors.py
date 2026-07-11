@@ -15,6 +15,7 @@ from config import (
     ALPHA_SPREAD_URL,
     DCF_JSON_KEY_HINTS,
     DCF_TEXT_REGEX_PATTERNS,
+    GURUFOCUS_DCF_URL,
     GURUFOCUS_EARNINGS_TERM_URL,
     JSON_URL_HINTS_ALPHASPREAD,
     PRICE_TARGET_JSON_KEY_HINTS,
@@ -93,6 +94,23 @@ _GURUFOCUS_EARNINGS_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_GURUFOCUS_FAIR_VALUE_PATTERNS = (
+    re.compile(
+        r"Fair\s*Value\s*\$?\s*(-?[\d]{1,3}(?:,[\d]{3})*(?:\.\d+)?|-?[\d]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"Fair\s*Value[^\n\r$]{0,40}\$\s*(-?[\d]{1,3}(?:,[\d]{3})*(?:\.\d+)?|-?[\d]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+)
+_GURUFOCUS_DCF_TABLE_SELECTOR = "div.stock-dcf-table"
+_GURUFOCUS_FAIR_VALUE_ROW_XPATH = (
+    "//div[contains(@class,'stock-dcf-table')]"
+    "//div[contains(@class,'dcf-table-row')]"
+    "[.//*[contains(normalize-space(.),'Fair Value')]]"
+)
+GURUFOCUS_TABLE_WAIT_MS = int(os.environ.get("GURUFOCUS_TABLE_WAIT_MS", "20000"))
 
 _SNIPPET_METRIC_PATTERNS = (
     re.compile(
@@ -181,7 +199,7 @@ def _google_query(job: ScrapeJob) -> str:
     if job.source == "valueinvesting":
         return f"{job.ticker} valueinvesting.io dcf valuation"
     if job.source == "gurufocus":
-        return f"DCF earnings based {job.ticker} guru focus"
+        return f"{job.ticker} gurufocus dcf fair value"
     if job.source == "price_target_low":
         return f"{job.ticker} analyst price target low yahoo finance"
     if job.source == "price_target_avg":
@@ -193,7 +211,7 @@ def _google_query(job: ScrapeJob) -> str:
 
 def _patterns_for_source(source: SourceKey) -> tuple[re.Pattern[str], ...]:
     if source == "gurufocus":
-        return _GURUFOCUS_EARNINGS_PATTERNS
+        return _GURUFOCUS_FAIR_VALUE_PATTERNS + _GURUFOCUS_EARNINGS_PATTERNS + _SNIPPET_METRIC_PATTERNS
     if source == "price_target_low":
         return (
             re.compile(r"(?:low|lowest)[^\n\r$]{0,80}\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)", re.I),
@@ -320,9 +338,37 @@ async def _dismiss_overlays(page: Page) -> None:
     for label in ("Accept", "Accept All", "I agree", "Got it", "Agree"):
         try:
             await page.get_by_role("button", name=label).click(timeout=1500)
+            break
+        except Exception:
+            continue
+    await _dismiss_gurufocus_signup_modal(page)
+
+
+async def _dismiss_gurufocus_signup_modal(page: Page) -> None:
+    """Close GuruFocus 'Track like a Guru' / signup dialogs without logging in."""
+    close_selectors = (
+        "button.el-dialog__headerbtn",
+        ".el-dialog__headerbtn",
+        ".el-message-box__headerbtn",
+        "button[aria-label='Close']",
+        ".el-overlay .el-dialog__close",
+    )
+    for selector in close_selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() == 0:
+                continue
+            await loc.click(timeout=1500)
+            logger.debug("Dismissed GuruFocus overlay via %s", selector)
+            await page.wait_for_timeout(400)
             return
         except Exception:
             continue
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
 
 
 async def _alpha_css(page: Page) -> str | None:
@@ -576,6 +622,50 @@ def _extract_gurufocus_earnings_value(text: str) -> str | None:
     return None
 
 
+def _extract_gurufocus_fair_value_text(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return None
+    for pattern in _GURUFOCUS_FAIR_VALUE_PATTERNS:
+        match = pattern.search(normalized)
+        if not match:
+            continue
+        value = normalize_numeric_string(match.group(1))
+        if value:
+            return value
+    match = _DOLLAR_RE.search(normalized)
+    if match:
+        return normalize_numeric_string(match.group(1))
+    return None
+
+
+async def _extract_gurufocus_dcf_fair_value(page: Page, ticker: str) -> PrimaryExtractionResult | None:
+    await _dismiss_gurufocus_signup_modal(page)
+    table = page.locator(_GURUFOCUS_DCF_TABLE_SELECTOR).first
+    try:
+        await table.wait_for(state="visible", timeout=GURUFOCUS_TABLE_WAIT_MS)
+    except Exception as exc:
+        logger.debug("[%s] GuruFocus DCF table not visible: %s", ticker, exc)
+        return None
+
+    fair_row = page.locator(f"xpath={_GURUFOCUS_FAIR_VALUE_ROW_XPATH}").first
+    if await fair_row.count() == 0:
+        logger.debug("[%s] GuruFocus Fair Value row not found in stock-dcf-table", ticker)
+        return None
+
+    try:
+        row_text = await fair_row.inner_text(timeout=5000)
+    except Exception as exc:
+        logger.debug("[%s] GuruFocus Fair Value row text failed: %s", ticker, exc)
+        return None
+
+    value = _extract_gurufocus_fair_value_text(row_text)
+    if value:
+        logger.info("[%s] GuruFocus Fair Value via dcf table -> %s", ticker, value)
+        return PrimaryExtractionResult(metric=value, method="dcf_table_fair_value")
+    return None
+
+
 async def _extract_gurufocus_earnings_term(page: Page, ticker: str) -> PrimaryExtractionResult | None:
     container = page.locator("#def_body_detail_height").first
     try:
@@ -617,14 +707,48 @@ async def _extract_gurufocus_earnings_term(page: Page, ticker: str) -> PrimaryEx
     return None
 
 
-async def _extract_gurufocus(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
-    ticker = job.ticker.strip().upper()
-    url = GURUFOCUS_EARNINGS_TERM_URL.format(ticker=ticker)
-    logger.info("[%s] GuruFocus primary navigation: %s", ticker, url)
+async def _gurufocus_wait_out_cloudflare(page: Page, ticker: str, timeout_ms: int = 25_000) -> int | None:
+    """If Cloudflare interstitial is showing, wait briefly for it to clear."""
+    import time
 
+    try:
+        title = (await page.title() or "").lower()
+    except Exception:
+        title = ""
+    content_hint = ""
+    try:
+        content_hint = (await page.content())[:2000].lower()
+    except Exception:
+        pass
+    challenged = (
+        "attention required" in title
+        or "just a moment" in title
+        or "cf-browser-verification" in content_hint
+        or ("cdn-cgi" in content_hint and "cloudflare" in content_hint)
+    )
+    if not challenged:
+        return None
+
+    logger.info("[%s] GuruFocus Cloudflare challenge detected; waiting up to %dms", ticker, timeout_ms)
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(1500)
+        try:
+            title = (await page.title() or "").lower()
+        except Exception:
+            continue
+        if "attention required" not in title and "just a moment" not in title:
+            logger.info("[%s] GuruFocus Cloudflare challenge cleared; title=%r", ticker, await page.title())
+            return 200
+    logger.warning("[%s] GuruFocus Cloudflare challenge did not clear", ticker)
+    return 403
+
+
+async def _gurufocus_goto(page: Page, url: str, ticker: str) -> int:
     await page.set_extra_http_headers({
         "Accept-Language": "en-US,en;q=0.9",
         "User-Agent": USER_AGENT,
+        "Referer": "https://www.gurufocus.com/",
     })
     response = await goto_with_retry(
         page,
@@ -636,18 +760,123 @@ async def _extract_gurufocus(page: Page, job: ScrapeJob) -> PrimaryExtractionRes
     )
     if response is None:
         raise RuntimeError("No response from primary navigation")
-
     status = response.status
     logger.info("[%s] Primary status=%s", ticker, status)
-    if status in {403, 429} or status >= 500:
+    if status in {403, 429}:
+        cleared = await _gurufocus_wait_out_cloudflare(page, ticker)
+        if cleared == 200:
+            return 200
         raise RuntimeError(f"Restrictive or unstable status: {status}")
+    if status >= 500:
+        raise RuntimeError(f"Restrictive or unstable status: {status}")
+    return status
 
+
+async def _gurufocus_goto_via_site_search(page: Page, ticker: str) -> bool:
+    """Reach the DCF page from homepage search to reuse an already-cleared CF session."""
+    home = "https://www.gurufocus.com/"
+    logger.info("[%s] GuruFocus in-site navigation via homepage search", ticker)
+    try:
+        response = await page.goto(home, wait_until="domcontentloaded", timeout=DIRECT_TIMEOUT_MS)
+        if response is not None and response.status in {403, 429}:
+            cleared = await _gurufocus_wait_out_cloudflare(page, ticker)
+            if cleared != 200:
+                return False
+        await page.wait_for_timeout(1500)
+        await _dismiss_overlays(page)
+
+        search = page.locator(
+            "input[placeholder*='Search' i], input[type='search'], "
+            "header input.el-input__inner, .gf-search input"
+        ).first
+        if await search.count() == 0:
+            # Fallback: SPA path change from a cleared homepage session.
+            await page.evaluate(
+                "(ticker) => { window.location.href = `/stock/${ticker}/dcf?search=${ticker}`; }",
+                ticker,
+            )
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(2000)
+        else:
+            await search.click(timeout=5000)
+            await search.fill(ticker)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(3000)
+            link = page.locator(f"a[href*='/stock/{ticker}']").first
+            if await link.count() > 0:
+                await link.click(timeout=5000)
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(1500)
+            # Ensure DCF tab/path
+            if "/dcf" not in (page.url or ""):
+                await page.goto(
+                    f"https://www.gurufocus.com/stock/{ticker}/dcf?search={ticker}",
+                    wait_until="domcontentloaded",
+                    timeout=DIRECT_TIMEOUT_MS,
+                )
+
+        title = (await page.title() or "").lower()
+        if "attention required" in title or "just a moment" in title:
+            cleared = await _gurufocus_wait_out_cloudflare(page, ticker)
+            if cleared != 200:
+                return False
+        return "gurufocus.com" in (page.url or "") and "attention required" not in title
+    except Exception as exc:
+        logger.warning("[%s] GuruFocus in-site navigation failed: %s", ticker, exc)
+        return False
+
+
+async def extract_gurufocus_metric(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+    """
+    Navigate to GuruFocus stock DCF page and read Fair Value from stock-dcf-table.
+
+    Falls back to in-site search navigation, then the legacy earnings-based term page.
+    """
+    ticker = job.ticker.strip().upper()
+    dcf_url = GURUFOCUS_DCF_URL.format(ticker=ticker)
+    logger.info("[%s] GuruFocus primary navigation: %s", ticker, dcf_url)
+
+    navigated = False
+    try:
+        await _gurufocus_goto(page, dcf_url, ticker)
+        navigated = True
+    except RuntimeError as exc:
+        if "Restrictive or unstable status" not in str(exc):
+            raise
+        logger.warning("[%s] Direct DCF blocked (%s); trying in-site navigation", ticker, exc)
+        navigated = await _gurufocus_goto_via_site_search(page, ticker)
+        if not navigated:
+            raise
+
+    await _dismiss_overlays(page)
+
+    dcf_result = await _extract_gurufocus_dcf_fair_value(page, ticker)
+    if dcf_result:
+        return dcf_result
+
+    # Body text fallback on DCF page (chart / labels still visible behind modal).
+    try:
+        body_text = await page.locator("body").inner_text(timeout=8000)
+        value = _extract_gurufocus_fair_value_text(body_text)
+        if value:
+            logger.info("[%s] GuruFocus Fair Value via dcf body text -> %s", ticker, value)
+            return PrimaryExtractionResult(metric=value, method="dcf_body_fair_value")
+    except Exception as exc:
+        logger.debug("[%s] GuruFocus DCF body extract failed: %s", ticker, exc)
+
+    term_url = GURUFOCUS_EARNINGS_TERM_URL.format(ticker=ticker)
+    logger.info("[%s] GuruFocus fallback term navigation: %s", ticker, term_url)
+    await _gurufocus_goto(page, term_url, ticker)
     await _dismiss_overlays(page)
     term_result = await _extract_gurufocus_earnings_term(page, ticker)
     if term_result:
         return term_result
 
-    raise RuntimeError("GuruFocus earnings-based DCF metric was not found")
+    raise RuntimeError("GuruFocus Fair Value / earnings-based DCF metric was not found")
+
+
+async def _extract_gurufocus(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+    return await extract_gurufocus_metric(page, job)
 
 
 def _price_targets_from_text(text: str) -> dict[str, str]:
