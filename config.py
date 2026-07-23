@@ -82,7 +82,7 @@ CREDENTIALS_PRIMARY = _env("GOOGLE_CREDENTIALS_PATH", "/usr/local/share/keys.jso
 
 ALPHA_SPREAD_URL = _env(
     "ALPHA_SPREAD_URL_TEMPLATE",
-    "https://www.alphaspread.com/security/{security_type}/{ticker}/dcf-valuation/base-case",
+    "https://www.alphaspread.com/security/{security_type}/{ticker}/summary",
 )
 VALUE_INVESTING_URL = _env(
     "VALUE_INVESTING_URL_TEMPLATE",

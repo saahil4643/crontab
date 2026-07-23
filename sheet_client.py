@@ -17,6 +17,7 @@ from config import (
 )
 from credentials import get_credentials
 from models import ScrapeJob
+from resilient_collector.progress_tracker import get_completed_rows
 from sheet_utils import (
     col_letter_to_index,
     has_stored_cell_value,
@@ -64,6 +65,11 @@ class DcfSheetClient:
         skipped_existing = 0
         skipped_non_us_empty = 0
         clear_non_us = 0
+        skipped_completed = 0
+        
+        completed_cache = {}
+        for block in MISSING_VALUE_BLOCKS:
+            completed_cache[block.source] = get_completed_rows(block.source)
         all_values = self._worksheet.get_all_values()
         if not all_values:
             logger.warning("Sheet is empty")
@@ -117,6 +123,10 @@ class DcfSheetClient:
                     skipped_existing += 1
                     continue
 
+                if row_num in completed_cache[block.source]:
+                    skipped_completed += 1
+                    continue
+
                 jobs.append(
                     ScrapeJob(
                         row=row_num,
@@ -133,13 +143,14 @@ class DcfSheetClient:
 
         logger.info(
             "Queued %d jobs (%d scrape, %d non-US clear, %d skipped existing, "
-            "%d non-US empty skipped) refresh_mode=%s",
+            "%d skipped completed, %d non-US empty skipped) refresh_mode=%s",
             len(jobs),
             len(jobs) - clear_non_us,
             clear_non_us,
             skipped_existing,
+            skipped_completed,
             skipped_non_us_empty,
-            "all" if refresh_all else "missing_only",
+            os.environ.get("RESILIENT_REFRESH_MODE", "all"),
         )
         return jobs
 

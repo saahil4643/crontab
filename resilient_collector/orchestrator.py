@@ -27,6 +27,7 @@ from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from resilient_collector.gurufocus_session import GuruFocusSession
 from resilient_collector.valueinvesting_session import ValueInvestingSession
 from resilient_collector.env_loader import load_env_file
+from resilient_collector.progress_tracker import mark_completed
 from resilient_collector.nav_retry import (
     interruptible_sleep_seconds,
     is_retryable_primary_failure,
@@ -839,7 +840,9 @@ async def _apply_job_result(
     result: TickerResult,
 ) -> SheetJobResult:
     if job.clear_only:
-        return await _apply_clear_only_job(writes, job)
+        res = await _apply_clear_only_job(writes, job)
+        mark_completed(job.source, job.row)
+        return res
 
     written = False
     if result.success and result.metric:
@@ -884,6 +887,10 @@ async def _apply_job_result(
             job.ticker,
             result.error,
         )
+        
+    if not result.transient:
+        mark_completed(job.source, job.row)
+        
     return SheetJobResult(job=job, result=result, written=written)
 
 

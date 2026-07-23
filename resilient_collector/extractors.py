@@ -396,6 +396,9 @@ async def _dismiss_gurufocus_signup_modal(page: Page) -> None:
 
 
 async def _alpha_css(page: Page) -> str | None:
+    summary_loc = page.locator("a.intrinsic-value-dcf-link div.detail").first
+    if await summary_loc.count() > 0:
+        return await summary_loc.inner_text(timeout=5000)
     loc = page.locator(".dcf-value-color.no-margin.valuation-scenario-value").first
     if await loc.count() > 0:
         return await loc.inner_text(timeout=5000)

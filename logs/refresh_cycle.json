@@ -1,18 +1,14 @@
 {
-  "completed": [
-    "valueinvesting",
-    "alphaspread",
-    "gurufocus"
-  ],
-  "current": "yahoo",
-  "cycle_id": "20260710-reset",
+  "completed": [],
+  "current": "valueinvesting",
+  "cycle_id": "20260722-reset",
   "phase_order": [
     "valueinvesting",
     "alphaspread",
     "gurufocus",
     "yahoo"
   ],
-  "started_at": "2026-07-10T21:10:40.055699-04:00",
-  "worker_pid": 2353014,
-  "worker_started_at": "2026-07-18T08:20:01.815175-04:00"
+  "started_at": "2026-07-22T22:12:35.473735-04:00",
+  "worker_pid": 1241245,
+  "worker_started_at": null
 }
