@@ -322,6 +322,30 @@ async def _navigate_collect(
     logger.info("[%s] %s status=%s", ticker, source_label, status)
     if status in {403, 429} or status >= 500:
         raise RuntimeError(f"{source_label} restrictive or unstable status: {status}")
+        
+    # Handle Yahoo Consent Redirect if detected
+    current_url = page.url.lower()
+    if "consent.yahoo.com" in current_url or "guce.yahoo.com" in current_url:
+        logger.info("[%s] Yahoo consent redirect detected. Handling...", ticker)
+        try:
+            scroll_btn = page.locator('#scroll-down-btn').first
+            if await scroll_btn.count() > 0:
+                await scroll_btn.click(timeout=3000)
+                await page.wait_for_timeout(1000)
+            
+            accept_btn = page.locator('button.accept-all, button[name="agree"]').first
+            if await accept_btn.count() > 0:
+                await accept_btn.click(force=True, timeout=5000)
+                logger.info("[%s] Yahoo consent accepted. Waiting for redirect...", ticker)
+                # Wait for redirection back to the target page / domain (allow up to 45s due to proxy latency)
+                await page.wait_for_url(
+                    lambda u: "consent" not in u.lower() and "guce" not in u.lower(),
+                    timeout=45000
+                )
+                logger.info("[%s] Redirect completed successfully back to: %s", ticker, page.url)
+        except Exception as e:
+            logger.warning("[%s] Failed to resolve Yahoo consent redirect: %s", ticker, e)
+
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except Exception:
@@ -905,6 +929,26 @@ async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtraction
         hints=("quote", "summary", "finance"),
         timeout=DIRECT_TIMEOUT_MS,
     )
+    
+    # Try parsing DOM selectors from the analyst target card directly (most reliable)
+    try:
+        card = page.locator('[data-testid="analyst-price-target-card"]')
+        if await card.count() > 0:
+            selector_map = {
+                "low": '.lowLabel .price',
+                "avg": '.average .price',
+                "high": '.highLabel .price',
+            }
+            price_element = card.locator(selector_map[kind]).first
+            if await price_element.count() > 0:
+                raw_val = await price_element.inner_text()
+                value = normalize_numeric_string(raw_val)
+                if value:
+                    logger.info("[%s] Yahoo %s price target extracted via DOM: %s", ticker, kind, value)
+                    return PrimaryExtractionResult(metric=value, method="dom_selector")
+    except Exception as dom_exc:
+        logger.debug("[%s] DOM scraping failed: %s", ticker, dom_exc)
+
     text_targets = _price_targets_from_text(text)
     if text_targets.get(kind):
         return PrimaryExtractionResult(metric=text_targets[kind], method="text")
@@ -914,51 +958,54 @@ async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtraction
     )
     if json_value:
         return PrimaryExtractionResult(metric=json_value, method="json")
-    quote_summary_base = YAHOO_QUOTE_SUMMARY_URL.format(ticker=ticker)
-    payload_text = await page.evaluate(
-        r"""async ({ ticker, crumbUrl, quoteSummaryBase }) => {
-            let crumb = window?.YAHOO?.context?.user?.crumb || window?.YAHOO?.context?.crumb || '';
-            if (!crumb) {
-                const html = document.documentElement.innerHTML || '';
-                const match = html.match(/"crumb"\s*:\s*"([^"]+)"/);
-                crumb = match ? match[1] : '';
-            }
-            if (!crumb) {
-                const crumbResponse = await fetch(crumbUrl, { credentials: 'include' });
-                if (!crumbResponse.ok) throw new Error(`crumb status ${crumbResponse.status}`);
-                crumb = (await crumbResponse.text()).trim();
-            }
-            const params = new URLSearchParams({
-                modules: 'financialData',
-                formatted: 'false',
-                lang: 'en-US',
-                region: 'US',
-                crumb,
-            });
-            const url = `${quoteSummaryBase}?${params.toString()}`;
-            const response = await fetch(url, { credentials: 'include' });
-            if (!response.ok) throw new Error(`quoteSummary status ${response.status}`);
-            return await response.text();
-        }""",
-        {
-            "ticker": ticker,
-            "crumbUrl": YAHOO_CRUMB_URL,
-            "quoteSummaryBase": quote_summary_base,
-        },
-    )
-    payload = json.loads(payload_text)
-    financial_data = (((payload.get("quoteSummary") or {}).get("result") or [{}])[0]).get("financialData") or {}
-    key = {
-        "low": "targetLowPrice",
-        "avg": "targetMeanPrice",
-        "high": "targetHighPrice",
-    }[kind]
-    raw = financial_data.get(key)
-    if isinstance(raw, dict):
-        raw = raw.get("raw", raw.get("fmt"))
-    value = normalize_numeric_string(str(raw)) if raw is not None else None
-    if value:
-        return PrimaryExtractionResult(metric=value, method="quote_summary")
+        
+    # Python-side crumb + API fetch to bypass CORS
+    try:
+        quote_summary_base = YAHOO_QUOTE_SUMMARY_URL.format(ticker=ticker)
+        html_content = await page.content()
+        crumb_match = re.search(r'"crumb"\s*:\s*"([^"]+)"', html_content)
+        crumb = crumb_match.group(1) if crumb_match else None
+        
+        if not crumb:
+            try:
+                crumb_resp = await page.context.request.get(YAHOO_CRUMB_URL)
+                if crumb_resp.ok:
+                    crumb = (await crumb_resp.text()).strip()
+            except Exception as e:
+                logger.debug("[%s] Failed to fetch crumb via API: %s", job.ticker, e)
+                
+        params = {
+            "modules": "financialData",
+            "formatted": "false",
+            "lang": "en-US",
+            "region": "US",
+        }
+        if crumb:
+            params["crumb"] = crumb
+            
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
+        api_url = f"{quote_summary_base}?{query_string}"
+        
+        resp = await page.context.request.get(api_url)
+        if resp.ok:
+            payload = await resp.json()
+            financial_data = (((payload.get("quoteSummary") or {}).get("result") or [{}])[0]).get("financialData") or {}
+            key = {
+                "low": "targetLowPrice",
+                "avg": "targetMeanPrice",
+                "high": "targetHighPrice",
+            }[kind]
+            raw = financial_data.get(key)
+            if isinstance(raw, dict):
+                raw = raw.get("raw", raw.get("fmt"))
+            value = normalize_numeric_string(str(raw)) if raw is not None else None
+            if value:
+                return PrimaryExtractionResult(metric=value, method="quote_summary")
+        else:
+            logger.debug("[%s] API fetch failed status: %d", job.ticker, resp.status)
+    except Exception as api_exc:
+        logger.debug("[%s] API fetch failed: %s", job.ticker, api_exc)
+        
     text_value = extract_from_text(text, PRICE_TARGET_TEXT_REGEX.get(kind, PRICE_TARGET_TEXT_REGEX["avg"]))
     if text_value:
         return PrimaryExtractionResult(metric=text_value, method="text_regex")

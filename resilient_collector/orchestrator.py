@@ -338,6 +338,21 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                     proxy=proxy.label,
                 )
             except Exception as primary_exc:
+                if job.source.startswith("price_target"):
+                    logger.warning(
+                        "[%s] %s primary failed (%s); skipping Google fallback as requested",
+                        job.ticker,
+                        job.source,
+                        primary_exc,
+                    )
+                    return TickerResult(
+                        ticker=job.ticker,
+                        success=False,
+                        source="primary",
+                        proxy=proxy.label,
+                        error=str(primary_exc),
+                        transient=is_retryable_primary_failure(primary_exc),
+                    )
                 logger.warning(
                     "[%s] %s primary failed (%s); handing off to Google fallback",
                     job.ticker,

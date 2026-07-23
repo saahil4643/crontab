@@ -107,7 +107,7 @@ GURUFOCUS_EARNINGS_TERM_URL = _env(
 )
 YAHOO_QUOTE_URL = _env(
     "YAHOO_QUOTE_URL_TEMPLATE",
-    "https://finance.yahoo.com/quote/{ticker}/",
+    "https://finance.yahoo.com/quote/{ticker}/analyst-insights/",
 )
 YAHOO_CRUMB_URL = _env(
     "YAHOO_CRUMB_URL",
