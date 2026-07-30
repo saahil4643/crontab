@@ -1,0 +1,8 @@
+{
+  "exit_code": 1,
+  "finished_at": "2026-07-30T14:55:02.490584+00:00",
+  "phase": "gurufocus",
+  "pid": 2350578,
+  "reason": "instance_lock_busy",
+  "status": "refused"
+}

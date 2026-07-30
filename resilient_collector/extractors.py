@@ -395,11 +395,34 @@ async def _dismiss_gurufocus_signup_modal(page: Page) -> None:
         pass
 
 
+_ADR_EXCHANGE_MAP = {
+    "PBR": "nyse",
+    "BABA": "nyse",
+    "NVO": "nyse",
+    "SAP": "nyse",
+    "BP": "nyse",
+    "DEO": "nyse",
+    "INFY": "nyse",
+    "ENB": "nyse",
+    "VALE": "nyse",
+    "EZPW": "nasdaq",
+    "GCT": "nasdaq",
+    "AMCX": "nasdaq",
+    "RGP": "nasdaq",
+    "KRT": "nasdaq",
+    "MCFT": "nasdaq",
+}
+
+def get_exchange_for_ticker(ticker: str) -> str:
+    return _ADR_EXCHANGE_MAP.get(ticker.upper(), "nasdaq")
+
+
 async def _alpha_css(page: Page) -> str | None:
     summary_loc = page.locator("a.intrinsic-value-dcf-link div.detail").first
     if await summary_loc.count() > 0:
         return await summary_loc.inner_text(timeout=5000)
-    loc = page.locator(".dcf-value-color.no-margin.valuation-scenario-value").first
+    # Target the first occurrence of pure DCF valuation element on dcf page fallback
+    loc = page.locator('div[class*="valuation-value"], div[class*="valuation-scenario-value"]').first
     if await loc.count() > 0:
         return await loc.inner_text(timeout=5000)
     important = page.locator("tr.important td.right.aligned.restriction-sensitive-data").first
@@ -409,7 +432,8 @@ async def _alpha_css(page: Page) -> str | None:
 
 
 async def _extract_alpha_spread(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
-    url = ALPHA_SPREAD_URL.format(security_type=job.security_type or "nasdaq", ticker=job.ticker)
+    exchange = get_exchange_for_ticker(job.ticker)
+    url = ALPHA_SPREAD_URL.format(security_type=exchange, ticker=job.ticker.lower())
     logger.info("[%s] Alpha Spread primary navigation: %s", job.ticker, url)
     payloads, text = await _navigate_collect(
         page,
@@ -420,16 +444,35 @@ async def _extract_alpha_spread(page: Page, job: ScrapeJob) -> PrimaryExtraction
         timeout=DIRECT_TIMEOUT_MS,
     )
     await _dismiss_overlays(page)
+
+    # Anti-Redirect Safety Guardrail
+    current_url = page.url.lower()
+    foreign_exchanges = ["bovespa", "tse", "lse", "xetra"]
+    if any(marker in current_url for marker in foreign_exchanges):
+        logger.warning(
+            "[%s] Foreign exchange redirect detected (%s). Forcing back to strict %s path: %s",
+            job.ticker, current_url, exchange.upper(), url
+        )
+        payloads, text = await _navigate_collect(
+            page,
+            url,
+            job.ticker,
+            "Alpha Spread",
+            hints=JSON_URL_HINTS_ALPHASPREAD,
+            timeout=DIRECT_TIMEOUT_MS,
+        )
+        await _dismiss_overlays(page)
+
+    css_value = await _alpha_css(page)
+    normalized = normalize_numeric_string(css_value or "")
+    if normalized:
+        return PrimaryExtractionResult(metric=normalized, method="css")
     json_value = extract_from_json_payloads(payloads, DCF_JSON_KEY_HINTS)
     if json_value:
         return PrimaryExtractionResult(metric=json_value, method="json")
     text_value = extract_from_text(text, DCF_TEXT_REGEX_PATTERNS)
     if text_value:
         return PrimaryExtractionResult(metric=text_value, method="text")
-    css_value = await _alpha_css(page)
-    normalized = normalize_numeric_string(css_value or "")
-    if normalized:
-        return PrimaryExtractionResult(metric=normalized, method="css")
     raise RuntimeError("Alpha Spread metric not found")
 
 
