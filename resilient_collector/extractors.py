@@ -418,10 +418,21 @@ def get_exchange_for_ticker(ticker: str) -> str:
 
 
 async def _alpha_css(page: Page) -> str | None:
+    # 1. First check the wire:key for dcf-base-case (matches both primary and secondary DCF buttons)
+    loc = page.locator('a[wire:key*="dcf-base-case"] div.detail').first
+    if await loc.count() > 0:
+        val = await loc.inner_text(timeout=2000)
+        if val.strip():
+            return val.strip()
+
+    # 2. Next check the legacy selector as a fallback for the summary page
     summary_loc = page.locator("a.intrinsic-value-dcf-link div.detail").first
     if await summary_loc.count() > 0:
-        return await summary_loc.inner_text(timeout=5000)
-    # Target the first occurrence of pure DCF valuation element on dcf page fallback
+        val = await summary_loc.inner_text(timeout=2000)
+        if val.strip():
+            return val.strip()
+
+    # 3. Target the first occurrence of pure DCF valuation element on dcf page fallback
     loc = page.locator('div[class*="valuation-value"], div[class*="valuation-scenario-value"]').first
     if await loc.count() > 0:
         return await loc.inner_text(timeout=5000)
