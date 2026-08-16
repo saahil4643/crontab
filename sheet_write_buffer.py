@@ -51,11 +51,13 @@ class SheetWriteBuffer:
         client: DcfSheetClient,
         *,
         pending_path: Path,
-        batch_size: int = SHEET_WRITE_BATCH_SIZE,
+        batch_size: int | None = None,
     ) -> None:
         self._client = client
         self._pending_path = pending_path
-        self._batch_size = max(1, batch_size)
+        # Re-read env at construct time so .env loaded after import still applies.
+        configured = _env_int("SHEET_WRITE_BATCH_SIZE", SHEET_WRITE_BATCH_SIZE)
+        self._batch_size = max(1, batch_size if batch_size is not None else configured)
         self._queue: list[CellUpdate] = []
         self._last_flush_at = time.monotonic()
         self._queued_total = 0
@@ -65,6 +67,10 @@ class SheetWriteBuffer:
     @property
     def client(self) -> DcfSheetClient:
         return self._client
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
 
     @property
     def pending_count(self) -> int:
@@ -136,6 +142,11 @@ class SheetWriteBuffer:
 
     async def maybe_flush(self) -> None:
         if len(self._queue) >= self._batch_size:
+            logger.info(
+                "[sheet] Buffer full (%d/%d); flushing batch to Google Sheets",
+                len(self._queue),
+                self._batch_size,
+            )
             await self.flush()
 
     async def flush(self) -> None:
@@ -143,6 +154,10 @@ class SheetWriteBuffer:
             return
         batch = self._queue
         self._queue = []
+        logger.info(
+            "[sheet] Sending %d cell update(s) to Google Sheets in one batch_update",
+            len(batch),
+        )
         applied = await self._flush_updates(batch, label="batch_flush")
         if applied < len(batch):
             failed = batch[applied:]
@@ -154,6 +169,12 @@ class SheetWriteBuffer:
             )
         self._flushed_total += applied
         self._last_flush_at = time.monotonic()
+        if applied:
+            logger.info(
+                "[sheet] Google Sheets batch flush complete | applied=%d remaining_buffer=%d",
+                applied,
+                len(self._queue),
+            )
 
     async def close(self) -> None:
         await self.flush()

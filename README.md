@@ -23,7 +23,8 @@ VALUEINVESTING_TABLE_WAIT_MS=35000
 
 # Scheduling
 RESILIENT_SCHEDULER=round_robin   # or legacy_batch
-RESILIENT_CHUNK_SIZE=10
+RESILIENT_CHUNK_SIZE=15
+SHEET_WRITE_BATCH_SIZE=15
 
 # Pacing (shorter with round-robin)
 RESILIENT_VALUEINVESTING_SLEEP_SECONDS=10
@@ -86,24 +87,10 @@ Mac local dev: add `--no-xvfb` and point `GOOGLE_CREDENTIALS_PATH` at your local
 
 Processes **missing cells only** for Alpha Spread, ValueInvesting, GuruFocus, and Yahoo price targets (low/avg/high).
 
-Default scheduler is **round-robin chunks**: up to `RESILIENT_CHUNK_SIZE` jobs per source (AS → VI → GF → Yahoo), write after each ticker, then switch source. Yahoo low/avg/high for the same ticker share one page load.
+Default scheduler is **round-robin chunks**: up to `RESILIENT_CHUNK_SIZE` jobs **per source** (AS → VI → GF → Yahoo), then switch. Yahoo low/avg/high for the same ticker share one page load.
+
+Successful cell updates are buffered and sent to Google Sheets in batches of `SHEET_WRITE_BATCH_SIZE` (default 15). Remaining cells flush when the run ends.
 
 Set `RESILIENT_SCHEDULER=legacy_batch` to restore the old “drain one site fully” order.
 
 If a primary site scrape fails, the cell is left empty (no Google search fallback).
-
-See `docs/round-robin-scrape-plan.md` for the design decisions.
-
-## GuruFocus network capture
-
-To record the DCF page APIs (HAR + live XHR/JSON) without running the sheet collector:
-
-```bash
-source venv/bin/activate
-cd tools/gurufocus-capture
-python capture_flow.py --ticker=CSAN
-# close the browser when the DCF table has loaded
-python distill_har.py csan-dcf
-```
-
-See `tools/gurufocus-capture/README.md`.

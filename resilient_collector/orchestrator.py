@@ -833,13 +833,15 @@ async def _apply_job_result(
             await writes.enqueue_write(job, value)
             written = True
             logger.info(
-                "[sheet] Wrote row=%d col=%s ticker=%s old=%r value=%s source=%s",
+                "[sheet] Buffered write row=%d col=%s ticker=%s old=%r value=%s source=%s "
+                "(flush when buffer reaches %d)",
                 job.row,
                 job.value_col,
                 job.ticker,
                 job.current_value,
                 value,
                 result.source,
+                writes.batch_size,
             )
         elif await _clear_stale_cell(writes, job, reason="normalized scrape result empty"):
             written = True
