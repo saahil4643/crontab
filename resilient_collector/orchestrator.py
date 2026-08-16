@@ -16,12 +16,11 @@ from config import SourceKey, USER_AGENT
 from logging_setup import setup_logging
 from models import ScrapeJob
 from resilient_collector.extractors import (
-    extract_google_fallback_metric,
-    extract_google_fallback_metric_for_job,
     extract_gurufocus_metric,
     extract_primary_metric,
     extract_primary_metric_for_job,
     extract_valueinvesting_metric,
+    extract_yahoo_price_targets,
 )
 from resilient_collector.valueinvesting_errors import ValueInvestingLimitError
 from resilient_collector.gurufocus_session import GuruFocusSession
@@ -31,10 +30,17 @@ from resilient_collector.progress_tracker import mark_completed
 from resilient_collector.nav_retry import (
     interruptible_sleep_seconds,
     is_retryable_primary_failure,
-    is_transient_nav_error,
     scrape_nav_retry_base_seconds,
 )
 from resilient_collector.proxy_pool import ProxyConfig, build_validated_pool
+from resilient_collector.scheduler import (
+    ROUND_ROBIN_ORDER,
+    YahooTickerGroup,
+    any_queue_nonempty,
+    partition_scrape_queues,
+    queue_remaining_summary,
+    take_chunk,
+)
 from scrapers.extract import format_for_sheet
 from sheet_client import DcfSheetClient
 from sheet_utils import has_stored_cell_value
@@ -46,15 +52,6 @@ logger = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent.parent
 _PENDING_WRITES_PATH = _ROOT / "logs" / "pending_sheet_writes.jsonl"
 
-BASELINE_SLEEP_SECONDS = int(os.environ.get("RESILIENT_SLEEP_BASELINE_SECONDS", "8"))
-GURUFOCUS_SLEEP_SECONDS = int(os.environ.get("RESILIENT_GURUFOCUS_SLEEP_SECONDS", "90"))
-# Pause between ValueInvesting tickers to reduce rate limits when reusing one browser.
-VALUEINVESTING_SLEEP_SECONDS = int(os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_SECONDS", "25"))
-VALUEINVESTING_SLEEP_JITTER_SECONDS = int(
-    os.environ.get("RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", "10")
-)
-JITTER_SECONDS = int(os.environ.get("RESILIENT_SLEEP_JITTER_SECONDS", "0"))
-
 
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -62,6 +59,48 @@ def env_bool(name: str, default: bool) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _scheduler_mode() -> str:
+    raw = (os.environ.get("RESILIENT_SCHEDULER") or "round_robin").strip().lower()
+    if raw in {"legacy", "legacy_batch", "batch"}:
+        return "legacy_batch"
+    return "round_robin"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return int(raw)
+
+
+def _sleep_default(name: str, *, legacy: int, round_robin: int) -> int:
+    """Explicit env wins; otherwise use shorter defaults in round_robin mode."""
+    raw = os.environ.get(name)
+    if raw is not None and str(raw).strip() != "":
+        return int(raw)
+    return round_robin if _scheduler_mode() == "round_robin" else legacy
+
+
+SCHEDULER_MODE = _scheduler_mode()
+CHUNK_SIZE = max(1, _env_int("RESILIENT_CHUNK_SIZE", 10))
+
+BASELINE_SLEEP_SECONDS = _sleep_default(
+    "RESILIENT_SLEEP_BASELINE_SECONDS", legacy=8, round_robin=4
+)
+GURUFOCUS_SLEEP_SECONDS = _sleep_default(
+    "RESILIENT_GURUFOCUS_SLEEP_SECONDS", legacy=90, round_robin=20
+)
+VALUEINVESTING_SLEEP_SECONDS = _sleep_default(
+    "RESILIENT_VALUEINVESTING_SLEEP_SECONDS", legacy=25, round_robin=10
+)
+VALUEINVESTING_SLEEP_JITTER_SECONDS = _sleep_default(
+    "RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", legacy=10, round_robin=5
+)
+YAHOO_SLEEP_SECONDS = _sleep_default(
+    "RESILIENT_YAHOO_SLEEP_SECONDS", legacy=8, round_robin=3
+)
+JITTER_SECONDS = int(os.environ.get("RESILIENT_SLEEP_JITTER_SECONDS", "0"))
 
 SHEET_RETRY_ATTEMPTS = int(os.environ.get("SHEET_RETRY_ATTEMPTS", "6"))
 SHEET_RETRY_BASE_SECONDS = float(os.environ.get("SHEET_RETRY_BASE_SECONDS", "2"))
@@ -81,50 +120,15 @@ SHEET_SOURCES: set[SourceKey] = {
     "price_target_avg",
     "price_target_high",
 }
+_YAHOO_KIND_BY_SOURCE: dict[SourceKey, str] = {
+    "price_target_low": "low",
+    "price_target_avg": "avg",
+    "price_target_high": "high",
+}
 
 
 def browser_headless() -> bool:
     return env_bool("RESILIENT_HEADLESS", False)
-
-
-async def _run_page_fallback_chain(
-    page: Page,
-    job: ScrapeJob,
-    proxy_label: str,
-    *,
-    transient_primary: bool = False,
-) -> TickerResult:
-    """Google search fallback after primary scrape failure."""
-    try:
-        google_result = await extract_google_fallback_metric_for_job(page, job)
-    except Exception as google_exc:
-        logger.warning("[%s] Google fallback failed: %s", job.ticker, google_exc)
-        return TickerResult(
-            ticker=job.ticker,
-            success=False,
-            source="fallbacks",
-            proxy=proxy_label,
-            error=str(google_exc),
-            transient=transient_primary or is_transient_nav_error(google_exc),
-        )
-
-    if google_result.metric:
-        return TickerResult(
-            ticker=job.ticker,
-            success=True,
-            source="google_fallback",
-            metric=google_result.metric,
-            proxy=proxy_label,
-        )
-
-    return TickerResult(
-        ticker=job.ticker,
-        success=False,
-        source="fallbacks",
-        proxy=proxy_label,
-        error="Google fallback completed but no metric was found",
-        transient=transient_primary,
-    )
 
 
 @dataclass
@@ -155,6 +159,8 @@ def compliance_sleep_seconds(source: SourceKey | None = None) -> int:
         low = max(0, VALUEINVESTING_SLEEP_SECONDS - VALUEINVESTING_SLEEP_JITTER_SECONDS)
         high = VALUEINVESTING_SLEEP_SECONDS + VALUEINVESTING_SLEEP_JITTER_SECONDS
         return random.randint(low, high)
+    if source in _YAHOO_KIND_BY_SOURCE:
+        return YAHOO_SLEEP_SECONDS
     if JITTER_SECONDS <= 0:
         return BASELINE_SLEEP_SECONDS
     return random.randint(max(0, BASELINE_SLEEP_SECONDS - JITTER_SECONDS), BASELINE_SLEEP_SECONDS + JITTER_SECONDS)
@@ -266,32 +272,14 @@ async def process_ticker(ticker: str, proxy_pool: list[ProxyConfig]) -> TickerRe
                     proxy=proxy.label,
                 )
             except Exception as primary_exc:
-                logger.warning(
-                    "[%s] Primary failed (%s); handing off to Google fallback",
-                    ticker,
-                    primary_exc,
-                )
-                try:
-                    google_result = await extract_google_fallback_metric(page, ticker)
-                except Exception as google_exc:
-                    logger.warning("[%s] Google fallback failed: %s", ticker, google_exc)
-                    google_result = None
-
-                if google_result and google_result.metric:
-                    return TickerResult(
-                        ticker=ticker,
-                        success=True,
-                        source="google_fallback",
-                        metric=google_result.metric,
-                        proxy=proxy.label,
-                    )
-
+                logger.warning("[%s] Primary failed (%s)", ticker, primary_exc)
                 return TickerResult(
                     ticker=ticker,
                     success=False,
-                    source="fallbacks",
+                    source="primary",
                     proxy=proxy.label,
-                    error="Google fallback completed but no metric was found",
+                    error=str(primary_exc),
+                    transient=is_retryable_primary_failure(primary_exc),
                 )
 
     except Exception as exc:
@@ -339,32 +327,19 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                     proxy=proxy.label,
                 )
             except Exception as primary_exc:
-                if job.source.startswith("price_target"):
-                    logger.warning(
-                        "[%s] %s primary failed (%s); skipping Google fallback as requested",
-                        job.ticker,
-                        job.source,
-                        primary_exc,
-                    )
-                    return TickerResult(
-                        ticker=job.ticker,
-                        success=False,
-                        source="primary",
-                        proxy=proxy.label,
-                        error=str(primary_exc),
-                        transient=is_retryable_primary_failure(primary_exc),
-                    )
                 logger.warning(
-                    "[%s] %s primary failed (%s); handing off to Google fallback",
+                    "[%s] %s primary failed (%s)",
                     job.ticker,
                     job.source,
                     primary_exc,
                 )
-                return await _run_page_fallback_chain(
-                    page,
-                    job,
-                    proxy.label,
-                    transient_primary=is_retryable_primary_failure(primary_exc),
+                return TickerResult(
+                    ticker=job.ticker,
+                    success=False,
+                    source="primary",
+                    proxy=proxy.label,
+                    error=str(primary_exc),
+                    transient=is_retryable_primary_failure(primary_exc),
                 )
 
     except Exception as exc:
@@ -473,7 +448,10 @@ async def _process_gurufocus_with_session(
                     exc,
                 )
                 session.record_view()
-                await session.rotate_identity()
+                if session.is_headless:
+                    await session.escalate_to_headed()
+                else:
+                    await session.rotate_identity()
                 try:
                     return await _scrape_once()
                 except Exception as retry_exc:
@@ -498,18 +476,15 @@ async def _process_gurufocus_with_session(
             break
 
     assert last_primary_exc is not None
-    logger.warning(
-        "[%s] gurufocus primary failed (%s); trying fallbacks",
-        job.ticker,
-        last_primary_exc,
-    )
+    logger.warning("[%s] gurufocus primary failed (%s)", job.ticker, last_primary_exc)
     session.record_view()
-    page = await session.ensure_page()
-    return await _run_page_fallback_chain(
-        page,
-        job,
-        session.proxy_label or proxy_label,
-        transient_primary=_is_gurufocus_block_error(last_primary_exc)
+    return TickerResult(
+        ticker=job.ticker,
+        success=False,
+        source="primary",
+        proxy=session.proxy_label or proxy_label,
+        error=str(last_primary_exc),
+        transient=_is_gurufocus_block_error(last_primary_exc)
         or is_retryable_primary_failure(last_primary_exc),
     )
 
@@ -618,25 +593,31 @@ async def _process_valueinvesting_with_session(
                 limit_exc,
             )
             if not allow_retry_on_limit:
-                session.record_view()
-                page = await session.ensure_page()
-                return await _run_page_fallback_chain(page, job, proxy_label)
+                return TickerResult(
+                    ticker=job.ticker,
+                    success=False,
+                    source="primary",
+                    proxy=proxy_label,
+                    error=str(limit_exc),
+                    transient=True,
+                )
             await session.rotate_identity()
             try:
                 return await _scrape_once()
             except Exception as retry_exc:
                 logger.warning(
-                    "[%s] valueinvesting retry failed (%s); trying fallbacks",
+                    "[%s] valueinvesting retry failed (%s)",
                     job.ticker,
                     retry_exc,
                 )
                 session.record_view()
-                page = await session.ensure_page()
-                return await _run_page_fallback_chain(
-                    page,
-                    job,
-                    proxy_label,
-                    transient_primary=is_retryable_primary_failure(retry_exc),
+                return TickerResult(
+                    ticker=job.ticker,
+                    success=False,
+                    source="primary",
+                    proxy=proxy_label,
+                    error=str(retry_exc),
+                    transient=is_retryable_primary_failure(retry_exc),
                 )
         except Exception as exc:
             last_primary_exc = exc
@@ -660,17 +641,18 @@ async def _process_valueinvesting_with_session(
 
     assert last_primary_exc is not None
     logger.warning(
-        "[%s] valueinvesting primary failed (%s); trying fallbacks",
+        "[%s] valueinvesting primary failed (%s)",
         job.ticker,
         last_primary_exc,
     )
     session.record_view()
-    page = await session.ensure_page()
-    return await _run_page_fallback_chain(
-        page,
-        job,
-        proxy_label,
-        transient_primary=is_retryable_primary_failure(last_primary_exc),
+    return TickerResult(
+        ticker=job.ticker,
+        success=False,
+        source="primary",
+        proxy=proxy_label,
+        error=str(last_primary_exc),
+        transient=is_retryable_primary_failure(last_primary_exc),
     )
 
 
@@ -894,6 +876,500 @@ async def _apply_job_result(
     return SheetJobResult(job=job, result=result, written=written)
 
 
+async def _process_job_on_page(
+    page: Page,
+    job: ScrapeJob,
+    proxy_label: str,
+) -> TickerResult:
+    try:
+        primary = await extract_primary_metric_for_job(page, job)
+        return TickerResult(
+            ticker=job.ticker,
+            success=True,
+            source=f"primary_{primary.method}",
+            metric=primary.metric,
+            proxy=proxy_label,
+        )
+    except Exception as primary_exc:
+        logger.warning(
+            "[%s] %s primary failed (%s)",
+            job.ticker,
+            job.source,
+            primary_exc,
+        )
+        return TickerResult(
+            ticker=job.ticker,
+            success=False,
+            source="primary",
+            proxy=proxy_label,
+            error=str(primary_exc),
+            transient=is_retryable_primary_failure(primary_exc),
+        )
+
+
+async def _process_alphaspread_chunk(
+    jobs: list[ScrapeJob],
+    proxy_pool: list[ProxyConfig],
+    *,
+    shutdown: ShutdownController | None = None,
+    round_num: int = 0,
+) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    if not jobs:
+        return
+
+    proxy = random.choice(proxy_pool)
+    browser: Browser | None = None
+    context: BrowserContext | None = None
+    page: Page | None = None
+    total = len(jobs)
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=browser_headless())
+            context = await create_isolated_context(browser, proxy)
+            page = await context.new_page()
+            await apply_stealth(page)
+
+            for index, job in enumerate(jobs, start=1):
+                if shutdown is not None and shutdown.is_requested():
+                    break
+                if shutdown is not None:
+                    shutdown.note_job(
+                        row=job.row,
+                        ticker=job.ticker,
+                        source=job.source,
+                        batch=f"AS-round{round_num}",
+                        batch_index=index,
+                        batch_total=total,
+                    )
+                logger.info(
+                    "[sheet] Processing row=%d ticker=%s source=alphaspread col=%s "
+                    "(round %d AS %d/%d)",
+                    job.row,
+                    job.ticker,
+                    job.value_col,
+                    round_num,
+                    index,
+                    total,
+                )
+                result = await _process_job_on_page(page, job, proxy.label)
+                logger.info(
+                    "[result] ticker=%s success=%s source=%s metric=%s error=%s",
+                    result.ticker,
+                    result.success,
+                    result.source,
+                    result.metric,
+                    result.error,
+                )
+                yield job, result
+                if shutdown is not None:
+                    shutdown.note_job_completed()
+                if index < total:
+                    if not await compliance_sleep("alphaspread", shutdown):
+                        break
+    finally:
+        await teardown(page, context, browser, "alphaspread-chunk")
+
+
+async def _process_yahoo_group_on_page(
+    page: Page,
+    group: YahooTickerGroup,
+    proxy_label: str,
+) -> list[tuple[ScrapeJob, TickerResult]]:
+    kinds = {
+        _YAHOO_KIND_BY_SOURCE[job.source]
+        for job in group.jobs
+        if job.source in _YAHOO_KIND_BY_SOURCE
+    }
+    try:
+        found = await extract_yahoo_price_targets(page, group.ticker, kinds=kinds)
+    except Exception as exc:
+        logger.warning("[%s] Yahoo coalesced scrape failed (%s)", group.ticker, exc)
+        transient = is_retryable_primary_failure(exc)
+        return [
+            (
+                job,
+                TickerResult(
+                    ticker=job.ticker,
+                    success=False,
+                    source="primary",
+                    proxy=proxy_label,
+                    error=str(exc),
+                    transient=transient,
+                ),
+            )
+            for job in group.jobs
+        ]
+
+    pairs: list[tuple[ScrapeJob, TickerResult]] = []
+    for job in group.jobs:
+        kind = _YAHOO_KIND_BY_SOURCE.get(job.source)
+        primary = found.get(kind) if kind else None
+        if primary:
+            pairs.append(
+                (
+                    job,
+                    TickerResult(
+                        ticker=job.ticker,
+                        success=True,
+                        source=f"primary_{primary.method}",
+                        metric=primary.metric,
+                        proxy=proxy_label,
+                    ),
+                )
+            )
+        else:
+            pairs.append(
+                (
+                    job,
+                    TickerResult(
+                        ticker=job.ticker,
+                        success=False,
+                        source="primary",
+                        proxy=proxy_label,
+                        error=f"Yahoo {kind} price target not found",
+                    ),
+                )
+            )
+    return pairs
+
+
+async def _process_yahoo_chunk(
+    groups: list[YahooTickerGroup],
+    proxy_pool: list[ProxyConfig],
+    *,
+    shutdown: ShutdownController | None = None,
+    round_num: int = 0,
+) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    if not groups:
+        return
+
+    proxy = random.choice(proxy_pool)
+    browser: Browser | None = None
+    context: BrowserContext | None = None
+    page: Page | None = None
+    total = len(groups)
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=browser_headless())
+            context = await create_isolated_context(browser, proxy)
+            page = await context.new_page()
+            await apply_stealth(page)
+
+            for index, group in enumerate(groups, start=1):
+                if shutdown is not None and shutdown.is_requested():
+                    break
+                first = group.jobs[0]
+                if shutdown is not None:
+                    shutdown.note_job(
+                        row=first.row,
+                        ticker=group.ticker,
+                        source=first.source,
+                        batch=f"YH-round{round_num}",
+                        batch_index=index,
+                        batch_total=total,
+                    )
+                logger.info(
+                    "[sheet] Processing Yahoo ticker=%s jobs=%d (round %d YH %d/%d)",
+                    group.ticker,
+                    len(group.jobs),
+                    round_num,
+                    index,
+                    total,
+                )
+                pairs = await _process_yahoo_group_on_page(page, group, proxy.label)
+                for job, result in pairs:
+                    logger.info(
+                        "[result] ticker=%s source=%s success=%s metric=%s error=%s",
+                        result.ticker,
+                        job.source,
+                        result.success,
+                        result.metric,
+                        result.error,
+                    )
+                    yield job, result
+                    if shutdown is not None:
+                        shutdown.note_job_completed()
+                if index < total:
+                    if not await compliance_sleep("price_target_avg", shutdown):
+                        break
+    finally:
+        await teardown(page, context, browser, "yahoo-chunk")
+
+
+async def _process_vi_chunk_with_session(
+    jobs: list[ScrapeJob],
+    session: ValueInvestingSession,
+    *,
+    shutdown: ShutdownController | None = None,
+    round_num: int = 0,
+) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    total = len(jobs)
+    for index, job in enumerate(jobs, start=1):
+        if shutdown is not None and shutdown.is_requested():
+            break
+        if shutdown is not None:
+            shutdown.note_job(
+                row=job.row,
+                ticker=job.ticker,
+                source=job.source,
+                batch=f"VI-round{round_num}",
+                batch_index=index,
+                batch_total=total,
+            )
+        logger.info(
+            "[sheet] Processing row=%d ticker=%s source=valueinvesting col=%s "
+            "(round %d VI %d/%d)",
+            job.row,
+            job.ticker,
+            job.value_col,
+            round_num,
+            index,
+            total,
+        )
+        result = await _process_valueinvesting_with_session(job, session)
+        logger.info(
+            "[result] ticker=%s success=%s source=%s metric=%s error=%s",
+            result.ticker,
+            result.success,
+            result.source,
+            result.metric,
+            result.error,
+        )
+        yield job, result
+        if shutdown is not None:
+            shutdown.note_job_completed()
+        if index < total:
+            if not await compliance_sleep("valueinvesting", shutdown):
+                break
+
+
+async def _process_gf_chunk_with_session(
+    jobs: list[ScrapeJob],
+    session: GuruFocusSession,
+    *,
+    shutdown: ShutdownController | None = None,
+    round_num: int = 0,
+) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    total = len(jobs)
+    for index, job in enumerate(jobs, start=1):
+        if shutdown is not None and shutdown.is_requested():
+            break
+        if shutdown is not None:
+            shutdown.note_job(
+                row=job.row,
+                ticker=job.ticker,
+                source=job.source,
+                batch=f"GF-round{round_num}",
+                batch_index=index,
+                batch_total=total,
+            )
+        logger.info(
+            "[sheet] Processing row=%d ticker=%s source=gurufocus col=%s "
+            "(round %d GF %d/%d)",
+            job.row,
+            job.ticker,
+            job.value_col,
+            round_num,
+            index,
+            total,
+        )
+        result = await _process_gurufocus_with_session(job, session)
+        logger.info(
+            "[result] ticker=%s success=%s source=%s metric=%s error=%s",
+            result.ticker,
+            result.success,
+            result.source,
+            result.metric,
+            result.error,
+        )
+        yield job, result
+        if shutdown is not None:
+            shutdown.note_job_completed()
+        if index < total:
+            if not await compliance_sleep("gurufocus", shutdown):
+                break
+
+
+async def _run_legacy_batch_scrape(
+    scrape_jobs: list[ScrapeJob],
+    proxy_pool: list[ProxyConfig],
+    writes: SheetWriteBuffer,
+    results: list[SheetJobResult],
+    job_cache: dict[tuple[str, SourceKey], TickerResult],
+    *,
+    shutdown: ShutdownController | None = None,
+) -> None:
+    vi_jobs, other_jobs = _partition_valueinvesting_jobs(scrape_jobs)
+    if vi_jobs and not (shutdown is not None and shutdown.is_requested()):
+        logger.info(
+            "[sheet] ValueInvesting batch: %d jobs (shared browser, rotate identity every %s views)",
+            len(vi_jobs),
+            os.environ.get("RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY", "5"),
+        )
+        async for job, result in process_valueinvesting_jobs(
+            vi_jobs, proxy_pool, shutdown=shutdown
+        ):
+            if shutdown is not None and shutdown.is_requested():
+                break
+            job_cache[(job.ticker, job.source)] = result
+            results.append(await _apply_job_result(writes, job, result))
+
+    gf_jobs, other_jobs = _partition_gurufocus_jobs(other_jobs)
+    if gf_jobs and not (shutdown is not None and shutdown.is_requested()):
+        logger.info(
+            "[sheet] GuruFocus batch: %d jobs (shared browser, rotate identity every %s views)",
+            len(gf_jobs),
+            os.environ.get("RESILIENT_GURUFOCUS_VIEWS_PER_IDENTITY", "15"),
+        )
+        async for job, result in process_gurufocus_jobs(
+            gf_jobs, proxy_pool, shutdown=shutdown
+        ):
+            if shutdown is not None and shutdown.is_requested():
+                break
+            job_cache[(job.ticker, job.source)] = result
+            results.append(await _apply_job_result(writes, job, result))
+
+    total_other = len(other_jobs)
+    for index, job in enumerate(other_jobs, start=1):
+        if shutdown is not None and shutdown.is_requested():
+            logger.warning(
+                "[sheet] Shutdown during scrape jobs at %d/%d | last row=%d ticker=%s source=%s",
+                index - 1,
+                total_other,
+                shutdown.progress.last_row or job.row,
+                shutdown.progress.last_ticker or job.ticker,
+                shutdown.progress.last_source or job.source,
+            )
+            break
+
+        if shutdown is not None:
+            shutdown.note_job(
+                row=job.row,
+                ticker=job.ticker,
+                source=job.source,
+                batch="scrape",
+                batch_index=index,
+                batch_total=total_other,
+            )
+
+        logger.info(
+            "[sheet] Processing row=%d ticker=%s source=%s col=%s (%d/%d)",
+            job.row,
+            job.ticker,
+            job.source,
+            job.value_col,
+            index,
+            total_other,
+        )
+
+        cache_key = (job.ticker, job.source)
+        if cache_key in job_cache:
+            result = job_cache[cache_key]
+            logger.info("[sheet] Reusing cached result for %s %s", job.ticker, job.source)
+        else:
+            result = await process_job(job, proxy_pool)
+            job_cache[cache_key] = result
+
+        results.append(await _apply_job_result(writes, job, result))
+        if shutdown is not None:
+            shutdown.note_job_completed()
+
+        if index < total_other:
+            if not await compliance_sleep(job.source, shutdown):
+                logger.warning(
+                    "[sheet] Shutdown during post-request pause at %d/%d | row=%d ticker=%s",
+                    index,
+                    total_other,
+                    job.row,
+                    job.ticker,
+                )
+                break
+
+
+async def _run_round_robin_scrape(
+    scrape_jobs: list[ScrapeJob],
+    proxy_pool: list[ProxyConfig],
+    writes: SheetWriteBuffer,
+    results: list[SheetJobResult],
+    job_cache: dict[tuple[str, SourceKey], TickerResult],
+    *,
+    shutdown: ShutdownController | None = None,
+) -> None:
+    queues = partition_scrape_queues(scrape_jobs)
+    logger.info(
+        "[sheet] Round-robin scheduler chunk_size=%d remaining %s",
+        CHUNK_SIZE,
+        queue_remaining_summary(queues),
+    )
+
+    vi_session = ValueInvestingSession(proxy_pool)
+    gf_session = GuruFocusSession(proxy_pool)
+    round_num = 0
+
+    try:
+        while any_queue_nonempty(queues):
+            if shutdown is not None and shutdown.is_requested():
+                break
+            round_num += 1
+            logger.info(
+                "[round %d] start | remaining %s",
+                round_num,
+                queue_remaining_summary(queues),
+            )
+
+            for source_name in ROUND_ROBIN_ORDER:
+                if shutdown is not None and shutdown.is_requested():
+                    break
+                queue = queues[source_name]
+                if not queue:
+                    continue
+
+                chunk = take_chunk(queue, CHUNK_SIZE)
+                logger.info(
+                    "[round %d] %s chunk=%d | remaining after take %s",
+                    round_num,
+                    source_name,
+                    len(chunk),
+                    queue_remaining_summary(queues),
+                )
+
+                if source_name == "alphaspread":
+                    async for job, result in _process_alphaspread_chunk(
+                        chunk, proxy_pool, shutdown=shutdown, round_num=round_num
+                    ):
+                        job_cache[(job.ticker, job.source)] = result
+                        results.append(await _apply_job_result(writes, job, result))
+                elif source_name == "valueinvesting":
+                    async for job, result in _process_vi_chunk_with_session(
+                        chunk, vi_session, shutdown=shutdown, round_num=round_num
+                    ):
+                        job_cache[(job.ticker, job.source)] = result
+                        results.append(await _apply_job_result(writes, job, result))
+                elif source_name == "gurufocus":
+                    async for job, result in _process_gf_chunk_with_session(
+                        chunk, gf_session, shutdown=shutdown, round_num=round_num
+                    ):
+                        job_cache[(job.ticker, job.source)] = result
+                        results.append(await _apply_job_result(writes, job, result))
+                elif source_name == "yahoo":
+                    async for job, result in _process_yahoo_chunk(
+                        chunk, proxy_pool, shutdown=shutdown, round_num=round_num
+                    ):
+                        job_cache[(job.ticker, job.source)] = result
+                        results.append(await _apply_job_result(writes, job, result))
+
+            logger.info(
+                "[round %d] done | remaining %s",
+                round_num,
+                queue_remaining_summary(queues),
+            )
+    finally:
+        await vi_session.close()
+        await gf_session.close()
+
+
 async def run_sheet_collector(
     *,
     dry_run: bool = False,
@@ -902,6 +1378,29 @@ async def run_sheet_collector(
     shutdown: ShutdownController | None = None,
 ) -> list[SheetJobResult]:
     load_env_file()
+    # Re-read scheduler knobs after .env load (module defaults may predate env).
+    global SCHEDULER_MODE, CHUNK_SIZE
+    global BASELINE_SLEEP_SECONDS, GURUFOCUS_SLEEP_SECONDS
+    global VALUEINVESTING_SLEEP_SECONDS, VALUEINVESTING_SLEEP_JITTER_SECONDS
+    global YAHOO_SLEEP_SECONDS
+    SCHEDULER_MODE = _scheduler_mode()
+    CHUNK_SIZE = max(1, _env_int("RESILIENT_CHUNK_SIZE", 10))
+    BASELINE_SLEEP_SECONDS = _sleep_default(
+        "RESILIENT_SLEEP_BASELINE_SECONDS", legacy=8, round_robin=4
+    )
+    GURUFOCUS_SLEEP_SECONDS = _sleep_default(
+        "RESILIENT_GURUFOCUS_SLEEP_SECONDS", legacy=90, round_robin=20
+    )
+    VALUEINVESTING_SLEEP_SECONDS = _sleep_default(
+        "RESILIENT_VALUEINVESTING_SLEEP_SECONDS", legacy=25, round_robin=10
+    )
+    VALUEINVESTING_SLEEP_JITTER_SECONDS = _sleep_default(
+        "RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS", legacy=10, round_robin=5
+    )
+    YAHOO_SLEEP_SECONDS = _sleep_default(
+        "RESILIENT_YAHOO_SLEEP_SECONDS", legacy=8, round_robin=3
+    )
+
     client = DcfSheetClient()
     writes = SheetWriteBuffer(client, pending_path=_PENDING_WRITES_PATH)
     await writes.replay_pending_file()
@@ -913,11 +1412,18 @@ async def run_sheet_collector(
     clear_jobs = [job for job in jobs if job.clear_only]
     scrape_jobs = [job for job in jobs if not job.clear_only]
     logger.info(
-        "[sheet] Processing %d jobs (%d scrape, %d non-US clear) dry_run=%s",
+        "[sheet] Processing %d jobs (%d scrape, %d non-US clear) dry_run=%s "
+        "scheduler=%s chunk_size=%d sleeps=gf:%ds vi:%ds baseline:%ds yahoo:%ds",
         len(jobs),
         len(scrape_jobs),
         len(clear_jobs),
         dry_run,
+        SCHEDULER_MODE,
+        CHUNK_SIZE,
+        GURUFOCUS_SLEEP_SECONDS,
+        VALUEINVESTING_SLEEP_SECONDS,
+        BASELINE_SLEEP_SECONDS,
+        YAHOO_SLEEP_SECONDS,
     )
     for job in jobs:
         logger.info(
@@ -953,91 +1459,24 @@ async def run_sheet_collector(
             if shutdown is not None:
                 shutdown.note_job_completed()
 
-        vi_jobs, other_jobs = _partition_valueinvesting_jobs(scrape_jobs)
-        if vi_jobs and not (shutdown is not None and shutdown.is_requested()):
-            logger.info(
-                "[sheet] ValueInvesting batch: %d jobs (shared browser, rotate identity every %s views)",
-                len(vi_jobs),
-                os.environ.get("RESILIENT_VALUEINVESTING_VIEWS_PER_IDENTITY", "5"),
+        if SCHEDULER_MODE == "legacy_batch":
+            await _run_legacy_batch_scrape(
+                scrape_jobs,
+                proxy_pool,
+                writes,
+                results,
+                job_cache,
+                shutdown=shutdown,
             )
-            async for job, result in process_valueinvesting_jobs(
-                vi_jobs, proxy_pool, shutdown=shutdown
-            ):
-                if shutdown is not None and shutdown.is_requested():
-                    break
-                job_cache[(job.ticker, job.source)] = result
-                results.append(await _apply_job_result(writes, job, result))
-
-        gf_jobs, other_jobs = _partition_gurufocus_jobs(other_jobs)
-        if gf_jobs and not (shutdown is not None and shutdown.is_requested()):
-            logger.info(
-                "[sheet] GuruFocus batch: %d jobs (shared browser, rotate identity every %s views)",
-                len(gf_jobs),
-                os.environ.get("RESILIENT_GURUFOCUS_VIEWS_PER_IDENTITY", "15"),
+        else:
+            await _run_round_robin_scrape(
+                scrape_jobs,
+                proxy_pool,
+                writes,
+                results,
+                job_cache,
+                shutdown=shutdown,
             )
-            async for job, result in process_gurufocus_jobs(
-                gf_jobs, proxy_pool, shutdown=shutdown
-            ):
-                if shutdown is not None and shutdown.is_requested():
-                    break
-                job_cache[(job.ticker, job.source)] = result
-                results.append(await _apply_job_result(writes, job, result))
-
-        total_other = len(other_jobs)
-        for index, job in enumerate(other_jobs, start=1):
-            if shutdown is not None and shutdown.is_requested():
-                logger.warning(
-                    "[sheet] Shutdown during scrape jobs at %d/%d | last row=%d ticker=%s source=%s",
-                    index - 1,
-                    total_other,
-                    shutdown.progress.last_row or job.row,
-                    shutdown.progress.last_ticker or job.ticker,
-                    shutdown.progress.last_source or job.source,
-                )
-                break
-
-            if shutdown is not None:
-                shutdown.note_job(
-                    row=job.row,
-                    ticker=job.ticker,
-                    source=job.source,
-                    batch="scrape",
-                    batch_index=index,
-                    batch_total=total_other,
-                )
-
-            logger.info(
-                "[sheet] Processing row=%d ticker=%s source=%s col=%s (%d/%d)",
-                job.row,
-                job.ticker,
-                job.source,
-                job.value_col,
-                index,
-                total_other,
-            )
-
-            cache_key = (job.ticker, job.source)
-            if cache_key in job_cache:
-                result = job_cache[cache_key]
-                logger.info("[sheet] Reusing cached result for %s %s", job.ticker, job.source)
-            else:
-                result = await process_job(job, proxy_pool)
-                job_cache[cache_key] = result
-
-            results.append(await _apply_job_result(writes, job, result))
-            if shutdown is not None:
-                shutdown.note_job_completed()
-
-            if index < total_other:
-                if not await compliance_sleep(job.source, shutdown):
-                    logger.warning(
-                        "[sheet] Shutdown during post-request pause at %d/%d | row=%d ticker=%s",
-                        index,
-                        total_other,
-                        job.row,
-                        job.ticker,
-                    )
-                    break
     finally:
         await writes.close()
 
@@ -1069,7 +1508,7 @@ def main() -> None:
     load_env_file()
     setup_logging(also_stdout=True)
     parser = argparse.ArgumentParser(
-        description="Resilient async collector with direct scrape and Google search fallback",
+        description="Resilient async collector with direct Playwright scraping",
     )
     parser.add_argument(
         "tickers",

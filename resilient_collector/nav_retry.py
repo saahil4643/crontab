@@ -23,6 +23,12 @@ _TRANSIENT_NAV_MARKERS: tuple[str, ...] = (
     "Timeout",
     "timeout exceeded",
     "net::err_",
+    # Local browser bootstrap issues — keep existing sheet values
+    "Executable doesn't exist",
+    "BrowserType.launch",
+    "playwright install",
+    "is not a valid selector",
+    "restrictive or unstable status",
 )
 
 

@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-from urllib.parse import quote_plus
 from typing import Any
 
 from playwright.async_api import Page
@@ -35,7 +34,6 @@ from scrapers.extract import extract_from_json_payloads, extract_from_text, norm
 
 logger = logging.getLogger(__name__)
 DIRECT_TIMEOUT_MS = int(os.environ.get("DIRECT_SCRAPE_TIMEOUT_MS", "30000"))
-SERP_TIMEOUT_MS = int(os.environ.get("SERP_TIMEOUT_MS", "15000"))
 VALUEINVESTING_TABLE_WAIT_MS = int(os.environ.get("VALUEINVESTING_TABLE_WAIT_MS", "35000"))
 VALUEINVESTING_CARD_WAIT_MS = int(os.environ.get("VALUEINVESTING_CARD_WAIT_MS", "8000"))
 
@@ -61,12 +59,6 @@ _VALUEINVESTING_FAIR_PRICE_ROW_XPATH = (
     "//table[contains(@class,'each_summary')]"
     "//tr[td[normalize-space()='Fair Price']]"
 )
-
-
-@dataclass
-class GoogleFallbackResult:
-    metric: str | None
-    snippets: list[str]
 
 
 @dataclass
@@ -112,40 +104,6 @@ _GURUFOCUS_FAIR_VALUE_ROW_XPATH = (
 )
 GURUFOCUS_TABLE_WAIT_MS = int(os.environ.get("GURUFOCUS_TABLE_WAIT_MS", "20000"))
 
-_SNIPPET_METRIC_PATTERNS = (
-    re.compile(
-        r"(?:DCF|intrinsic value|fair value)[^\n\r$]{0,80}\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)[^\n\r]{0,80}(?:DCF|intrinsic value|fair value)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"Fair\s*Value[\s:]*\$?\s*(-?[\d,]+\.?\d*)",
-        re.IGNORECASE,
-    ),
-)
-
-_GOOGLE_SNIPPET_SELECTORS = (
-    "#search > div",
-    "div.VwiC3b",
-    "span.hgKElc",
-    "div[data-sncf]",
-    "div[data-content-feature='1']",
-    "div.IsZvec",
-    "div.kb0PBd",
-    "div.g",
-    "#search",
-)
-
-_GOOGLE_BLOCKED_MARKERS = (
-    "our systems have detected unusual traffic",
-    "sorry, but your computer or network may be sending automated queries",
-    "before you continue to google search",
-    "captcha",
-)
-
 _SOURCE_LABELS: dict[SourceKey, str] = {
     "alphaspread": "Alpha Spread DCF fair value",
     "valueinvesting": "ValueInvesting DCF fair value",
@@ -180,100 +138,6 @@ _PRICE_TEXT_PATTERN = re.compile(
 
 def source_metric_label(source: SourceKey) -> str:
     return _SOURCE_LABELS.get(source, source)
-
-
-def extract_metric_from_snippet(text: str) -> str | None:
-    normalized = re.sub(r"\s+", " ", text)
-    for pattern in _SNIPPET_METRIC_PATTERNS:
-        match = pattern.search(normalized)
-        if match:
-            value = normalize_numeric_string(match.group(1))
-            if value:
-                return value
-    return None
-
-
-def _google_query(job: ScrapeJob) -> str:
-    if job.source == "alphaspread":
-        return f"{job.ticker} alphaspread dcf valuation"
-    if job.source == "valueinvesting":
-        return f"{job.ticker} valueinvesting.io dcf valuation"
-    if job.source == "gurufocus":
-        return f"{job.ticker} gurufocus dcf fair value"
-    if job.source == "price_target_low":
-        return f"{job.ticker} analyst price target low yahoo finance"
-    if job.source == "price_target_avg":
-        return f"{job.ticker} analyst average price target yahoo finance"
-    if job.source == "price_target_high":
-        return f"{job.ticker} analyst high price target yahoo finance"
-    return f"{job.ticker} {job.label}"
-
-
-def _patterns_for_source(source: SourceKey) -> tuple[re.Pattern[str], ...]:
-    if source == "gurufocus":
-        return _GURUFOCUS_FAIR_VALUE_PATTERNS + _GURUFOCUS_EARNINGS_PATTERNS + _SNIPPET_METRIC_PATTERNS
-    if source == "price_target_low":
-        return (
-            re.compile(r"(?:low|lowest)[^\n\r$]{0,80}\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)", re.I),
-            re.compile(r"\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)[^\n\r]{0,80}(?:low|lowest)", re.I),
-        )
-    if source == "price_target_avg":
-        return (
-            re.compile(r"(?:average|mean|consensus)[^\n\r$]{0,80}\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)", re.I),
-            re.compile(r"\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)[^\n\r]{0,80}(?:average|mean|consensus)", re.I),
-        )
-    if source == "price_target_high":
-        return (
-            re.compile(r"(?:high|highest)[^\n\r$]{0,80}\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)", re.I),
-            re.compile(r"\$?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)[^\n\r]{0,80}(?:high|highest)", re.I),
-        )
-    return _SNIPPET_METRIC_PATTERNS
-
-
-def extract_metric_from_snippet_for_source(text: str, source: SourceKey) -> str | None:
-    normalized = re.sub(r"\s+", " ", text)
-    for pattern in _patterns_for_source(source):
-        match = pattern.search(normalized)
-        if match:
-            value = normalize_numeric_string(match.group(1))
-            if value:
-                return value
-    if source == "gurufocus":
-        return None
-    return extract_metric_from_snippet(text)
-
-
-def _dedupe_texts(texts: list[str], *, max_items: int = 20) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for text in texts:
-        normalized = re.sub(r"\s+", " ", text).strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        deduped.append(normalized)
-        if len(deduped) >= max_items:
-            break
-    return deduped
-
-
-async def _collect_google_snippets(page: Page) -> list[str]:
-    snippets: list[str] = []
-    for selector in _GOOGLE_SNIPPET_SELECTORS:
-        try:
-            texts = await page.locator(selector).all_text_contents()
-            snippets.extend(t.strip() for t in texts if t.strip())
-        except Exception:
-            continue
-    return _dedupe_texts(snippets)
-
-
-def _extract_google_metric(snippets: list[str], source: SourceKey) -> str | None:
-    for snippet in snippets:
-        value = extract_metric_from_snippet_for_source(snippet, source)
-        if value:
-            return value
-    return None
 
 
 async def _capture_response_json(response: Any, hints: tuple[str, ...], payloads: list[Any]) -> None:
@@ -418,10 +282,19 @@ def get_exchange_for_ticker(ticker: str) -> str:
 
 
 async def _alpha_css(page: Page) -> str | None:
-    # 1. First check the wire:key for dcf-base-case (matches both primary and secondary DCF buttons)
-    loc = page.locator('a[wire:key*="dcf-base-case"] div.detail').first
+    # 1. Livewire DCF base-case control (colon in attr must be escaped for CSS)
+    loc = page.locator('a[wire\\:key*="dcf-base-case"] div.detail').first
     if await loc.count() > 0:
         val = await loc.inner_text(timeout=2000)
+        if val.strip():
+            return val.strip()
+
+    # XPath fallback if CSS attribute escaping differs across engines
+    xpath_loc = page.locator(
+        "xpath=//a[contains(@*[name()='wire:key'], 'dcf-base-case')]//div[contains(@class,'detail')]"
+    ).first
+    if await xpath_loc.count() > 0:
+        val = await xpath_loc.inner_text(timeout=2000)
         if val.strip():
             return val.strip()
 
@@ -973,64 +846,45 @@ def _price_targets_from_text(text: str) -> dict[str, str]:
     return {key: value for key, value in values.items() if value}
 
 
-async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
-    kind = _PRICE_TARGET_KIND[job.source]
-    ticker = job.ticker.strip().upper()
-    url = YAHOO_QUOTE_URL.format(ticker=ticker)
-    logger.info("[%s] Yahoo primary navigation: %s", job.ticker, url)
-    payloads, text = await _navigate_collect(
-        page,
-        url,
-        job.ticker,
-        "Yahoo Finance",
-        hints=("quote", "summary", "finance"),
-        timeout=DIRECT_TIMEOUT_MS,
-    )
-    
-    # Try parsing DOM selectors from the analyst target card directly (most reliable)
+async def _yahoo_dom_targets(page: Page) -> dict[str, str]:
+    targets: dict[str, str] = {}
     try:
         card = page.locator('[data-testid="analyst-price-target-card"]')
-        if await card.count() > 0:
-            selector_map = {
-                "low": '.lowLabel .price',
-                "avg": '.average .price',
-                "high": '.highLabel .price',
-            }
-            price_element = card.locator(selector_map[kind]).first
-            if await price_element.count() > 0:
-                raw_val = await price_element.inner_text()
-                value = normalize_numeric_string(raw_val)
-                if value:
-                    logger.info("[%s] Yahoo %s price target extracted via DOM: %s", ticker, kind, value)
-                    return PrimaryExtractionResult(metric=value, method="dom_selector")
+        if await card.count() == 0:
+            return targets
+        selector_map = {
+            "low": ".lowLabel .price",
+            "avg": ".average .price",
+            "high": ".highLabel .price",
+        }
+        for kind, selector in selector_map.items():
+            price_element = card.locator(selector).first
+            if await price_element.count() == 0:
+                continue
+            value = normalize_numeric_string(await price_element.inner_text())
+            if value:
+                targets[kind] = value
     except Exception as dom_exc:
-        logger.debug("[%s] DOM scraping failed: %s", ticker, dom_exc)
+        logger.debug("Yahoo DOM target scrape failed: %s", dom_exc)
+    return targets
 
-    text_targets = _price_targets_from_text(text)
-    if text_targets.get(kind):
-        return PrimaryExtractionResult(metric=text_targets[kind], method="text")
-    json_value = extract_from_json_payloads(
-        payloads,
-        PRICE_TARGET_JSON_KEY_HINTS.get(kind, PRICE_TARGET_JSON_KEY_HINTS["avg"]),
-    )
-    if json_value:
-        return PrimaryExtractionResult(metric=json_value, method="json")
-        
-    # Python-side crumb + API fetch to bypass CORS
+
+async def _yahoo_quote_summary_targets(page: Page, ticker: str) -> dict[str, str]:
+    targets: dict[str, str] = {}
     try:
         quote_summary_base = YAHOO_QUOTE_SUMMARY_URL.format(ticker=ticker)
         html_content = await page.content()
         crumb_match = re.search(r'"crumb"\s*:\s*"([^"]+)"', html_content)
         crumb = crumb_match.group(1) if crumb_match else None
-        
+
         if not crumb:
             try:
                 crumb_resp = await page.context.request.get(YAHOO_CRUMB_URL)
                 if crumb_resp.ok:
                     crumb = (await crumb_resp.text()).strip()
-            except Exception as e:
-                logger.debug("[%s] Failed to fetch crumb via API: %s", job.ticker, e)
-                
+            except Exception as exc:
+                logger.debug("[%s] Failed to fetch crumb via API: %s", ticker, exc)
+
         params = {
             "modules": "financialData",
             "formatted": "false",
@@ -1039,33 +893,108 @@ async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtraction
         }
         if crumb:
             params["crumb"] = crumb
-            
+
         query_string = "&".join(f"{k}={v}" for k, v in params.items())
         api_url = f"{quote_summary_base}?{query_string}"
-        
         resp = await page.context.request.get(api_url)
-        if resp.ok:
-            payload = await resp.json()
-            financial_data = (((payload.get("quoteSummary") or {}).get("result") or [{}])[0]).get("financialData") or {}
-            key = {
-                "low": "targetLowPrice",
-                "avg": "targetMeanPrice",
-                "high": "targetHighPrice",
-            }[kind]
+        if not resp.ok:
+            logger.debug("[%s] Yahoo quoteSummary status: %d", ticker, resp.status)
+            return targets
+
+        payload = await resp.json()
+        financial_data = (
+            ((payload.get("quoteSummary") or {}).get("result") or [{}])[0]
+        ).get("financialData") or {}
+        key_map = {
+            "low": "targetLowPrice",
+            "avg": "targetMeanPrice",
+            "high": "targetHighPrice",
+        }
+        for kind, key in key_map.items():
             raw = financial_data.get(key)
             if isinstance(raw, dict):
                 raw = raw.get("raw", raw.get("fmt"))
             value = normalize_numeric_string(str(raw)) if raw is not None else None
             if value:
-                return PrimaryExtractionResult(metric=value, method="quote_summary")
-        else:
-            logger.debug("[%s] API fetch failed status: %d", job.ticker, resp.status)
+                targets[kind] = value
     except Exception as api_exc:
-        logger.debug("[%s] API fetch failed: %s", job.ticker, api_exc)
-        
-    text_value = extract_from_text(text, PRICE_TARGET_TEXT_REGEX.get(kind, PRICE_TARGET_TEXT_REGEX["avg"]))
-    if text_value:
-        return PrimaryExtractionResult(metric=text_value, method="text_regex")
+        logger.debug("[%s] Yahoo quoteSummary failed: %s", ticker, api_exc)
+    return targets
+
+
+async def extract_yahoo_price_targets(
+    page: Page,
+    ticker: str,
+    *,
+    kinds: set[str] | None = None,
+) -> dict[str, PrimaryExtractionResult]:
+    """
+    One Yahoo quote navigation → low/avg/high targets.
+    `kinds` limits which targets to return (e.g. {"low","avg"}).
+    """
+    wanted = kinds or {"low", "avg", "high"}
+    symbol = ticker.strip().upper()
+    url = YAHOO_QUOTE_URL.format(ticker=symbol)
+    logger.info("[%s] Yahoo primary navigation (coalesced): %s", symbol, url)
+    payloads, text = await _navigate_collect(
+        page,
+        url,
+        symbol,
+        "Yahoo Finance",
+        hints=("quote", "summary", "finance"),
+        timeout=DIRECT_TIMEOUT_MS,
+    )
+
+    found: dict[str, PrimaryExtractionResult] = {}
+
+    for kind, value in (await _yahoo_dom_targets(page)).items():
+        if kind in wanted and kind not in found:
+            found[kind] = PrimaryExtractionResult(metric=value, method="dom_selector")
+
+    text_targets = _price_targets_from_text(text)
+    for kind, value in text_targets.items():
+        if kind in wanted and kind not in found:
+            found[kind] = PrimaryExtractionResult(metric=value, method="text")
+
+    for kind in wanted:
+        if kind in found:
+            continue
+        json_value = extract_from_json_payloads(
+            payloads,
+            PRICE_TARGET_JSON_KEY_HINTS.get(kind, PRICE_TARGET_JSON_KEY_HINTS["avg"]),
+        )
+        if json_value:
+            found[kind] = PrimaryExtractionResult(metric=json_value, method="json")
+
+    for kind, value in (await _yahoo_quote_summary_targets(page, symbol)).items():
+        if kind in wanted and kind not in found:
+            found[kind] = PrimaryExtractionResult(metric=value, method="quote_summary")
+
+    for kind in wanted:
+        if kind in found:
+            continue
+        text_value = extract_from_text(
+            text, PRICE_TARGET_TEXT_REGEX.get(kind, PRICE_TARGET_TEXT_REGEX["avg"])
+        )
+        if text_value:
+            found[kind] = PrimaryExtractionResult(metric=text_value, method="text_regex")
+
+    return found
+
+
+async def _extract_price_target(page: Page, job: ScrapeJob) -> PrimaryExtractionResult:
+    kind = _PRICE_TARGET_KIND[job.source]
+    found = await extract_yahoo_price_targets(page, job.ticker, kinds={kind})
+    result = found.get(kind)
+    if result:
+        logger.info(
+            "[%s] Yahoo %s price target extracted via %s: %s",
+            job.ticker,
+            kind,
+            result.method,
+            result.metric,
+        )
+        return result
     raise RuntimeError(f"Yahoo {kind} price target not found")
 
 
@@ -1091,56 +1020,3 @@ async def extract_primary_metric(page: Page, ticker: str) -> str:
         label="GuruFocus",
     )
     return (await extract_primary_metric_for_job(page, job)).metric
-
-
-async def extract_google_fallback_metric_for_job(page: Page, job: ScrapeJob) -> GoogleFallbackResult:
-    query = _google_query(job)
-    logger.info("[%s] Fallback: Google search %r", job.ticker, query)
-    search_url = f"https://www.google.com/search?q={quote_plus(query)}&hl=en"
-    await page.set_extra_http_headers({
-        "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": USER_AGENT,
-    })
-    await goto_with_retry(
-        page,
-        search_url,
-        ticker=job.ticker,
-        label="Google fallback",
-        wait_until="domcontentloaded",
-        timeout_ms=SERP_TIMEOUT_MS,
-    )
-    try:
-        await _dismiss_overlays(page)
-    except Exception:
-        pass
-    try:
-        await page.wait_for_load_state("networkidle", timeout=SERP_TIMEOUT_MS)
-    except Exception:
-        pass
-    await page.wait_for_timeout(1500)
-
-    snippets = await _collect_google_snippets(page)
-    try:
-        body_text = (await page.locator("body").inner_text(timeout=5000)).lower()
-        if any(marker in body_text for marker in _GOOGLE_BLOCKED_MARKERS):
-            logger.warning("[%s] Google fallback appears blocked or challenged", job.ticker)
-    except Exception:
-        pass
-
-    logger.info("[%s] Fallback collected %d search snippets", job.ticker, len(snippets))
-    metric = _extract_google_metric(snippets, job.source)
-    if metric:
-        logger.info("[%s] Google fallback extracted metric=%s", job.ticker, metric)
-    return GoogleFallbackResult(metric=metric, snippets=snippets)
-
-
-async def extract_google_fallback_metric(page: Page, ticker: str) -> GoogleFallbackResult:
-    job = ScrapeJob(
-        row=0,
-        ticker=ticker,
-        source="gurufocus",
-        value_col="",
-        value_col_index=0,
-        label="GuruFocus",
-    )
-    return await extract_google_fallback_metric_for_job(page, job)

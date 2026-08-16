@@ -1,27 +1,61 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
 venv/
 .venv/
 ven/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.cache/
 
 # Secrets — never commit
 keys.json
+*.pem
 .env
+.env.*
+!.env.example
 gurufocus_auth.json
+.gurufocus-storage-state.json
+**/credentials*.json
+**/service-account*.json
 
 # Runtime artifacts
-logs/*.log
-logs/*.out
-logs/*.pid
-logs/pending_sheet_writes.jsonl
-logs/captures/
-logs/capture-test/
+logs/
+!logs/.gitkeep
 debug_*.png
 .playwright/
+.playwright-browsers/
 browser-profile/
+*.pid
+*.out
+
+# Local tooling / planning (not production collector business logic)
+tools/
+docs/
+
+# Capture / scrape dumps (not business logic)
+*.har
+*.jsonl
+screenshots/
+**/traces/
+**/flows/
+**/screens/
 
 # OS / IDE
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
