@@ -24,13 +24,22 @@ VALUEINVESTING_TABLE_WAIT_MS=35000
 # Scheduling
 RESILIENT_SCHEDULER=round_robin   # or legacy_batch
 RESILIENT_CHUNK_SIZE=15
+RESILIENT_ALPHASPREAD_CHUNK_SIZE=1
 SHEET_WRITE_BATCH_SIZE=15
 
-# Pacing (shorter with round-robin)
+# Pacing (shorter with round-robin; Alpha Spread stays at 8s isolated browsers)
 RESILIENT_VALUEINVESTING_SLEEP_SECONDS=10
 RESILIENT_VALUEINVESTING_SLEEP_JITTER_SECONDS=5
 RESILIENT_VALUEINVESTING_POST_ROTATION_SLEEP_SECONDS=15
 RESILIENT_SLEEP_BASELINE_SECONDS=4
+RESILIENT_ALPHASPREAD_SLEEP_SECONDS=8
+RESILIENT_ALPHASPREAD_JOB_TIMEOUT_SECONDS=120
+RESILIENT_ALPHASPREAD_RETRY_BASE_SECONDS=480
+RESILIENT_ALPHASPREAD_RETRY_CAP_SECONDS=4500
+RESILIENT_ALPHASPREAD_RETRY_MAX_ATTEMPTS=5
+RESILIENT_ALPHASPREAD_BREAKER_THRESHOLD=3
+RESILIENT_ALPHASPREAD_BREAKER_WINDOW_SECONDS=600
+RESILIENT_ALPHASPREAD_BREAKER_COOLDOWN_SECONDS=2700
 RESILIENT_GURUFOCUS_SLEEP_SECONDS=20
 RESILIENT_YAHOO_SLEEP_SECONDS=3
 RESILIENT_GURUFOCUS_VIEWS_PER_IDENTITY=15
@@ -87,7 +96,7 @@ Mac local dev: add `--no-xvfb` and point `GOOGLE_CREDENTIALS_PATH` at your local
 
 Processes **missing cells only** for Alpha Spread, ValueInvesting, GuruFocus, and Yahoo price targets (low/avg/high).
 
-Default scheduler is **round-robin chunks**: up to `RESILIENT_CHUNK_SIZE` jobs **per source** (AS → VI → GF → Yahoo), then switch. Yahoo low/avg/high for the same ticker share one page load.
+Default scheduler is **round-robin chunks**: up to `RESILIENT_CHUNK_SIZE` jobs per source (AS → VI → GF → Yahoo), then switch. **Alpha Spread is different:** `RESILIENT_ALPHASPREAD_CHUNK_SIZE` defaults to **1**, and each ticker gets a **new browser** plus an **~8s** pause with light jitter (`RESILIENT_ALPHASPREAD_SLEEP_SECONDS`). Reusing one page for 15 Alpha Spread tickers caused HTTP 403 after the first success. A 403/timeout is retried later in the same run (exponential backoff, max 5 attempts). Three 403s in 10 minutes trip a circuit breaker that pauses **only** Alpha Spread (~45 min) while other sources continue. Each Alpha Spread job has a 120s hang watchdog. Yahoo low/avg/high for the same ticker share one page load.
 
 Successful cell updates are buffered and sent to Google Sheets in batches of `SHEET_WRITE_BATCH_SIZE` (default 15). Remaining cells flush when the run ends.
 

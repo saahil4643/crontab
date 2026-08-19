@@ -27,6 +27,7 @@ class WorkerProgress:
     last_row: int | None = None
     last_ticker: str | None = None
     last_source: str | None = None
+    extra: str = ""
 
     def snapshot(self) -> str:
         last = (
@@ -37,8 +38,9 @@ class WorkerProgress:
         batch_part = ""
         if self.batch:
             batch_part = f" | batch={self.batch} {self.batch_index}/{self.batch_total}"
+        extra_part = f" | {self.extra}" if self.extra else ""
         return (
-            f"jobs_done={self.jobs_done}/{self.total_jobs}{batch_part} | last={last}"
+            f"jobs_done={self.jobs_done}/{self.total_jobs}{batch_part} | last={last}{extra_part}"
         )
 
 

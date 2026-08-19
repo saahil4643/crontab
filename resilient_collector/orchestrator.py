@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import random
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -27,6 +28,7 @@ from resilient_collector.gurufocus_session import GuruFocusSession
 from resilient_collector.valueinvesting_session import ValueInvestingSession
 from resilient_collector.env_loader import load_env_file
 from resilient_collector.progress_tracker import mark_completed
+from resilient_collector.alphaspread_guard import AlphaSpreadGuard, apply_jitter
 from resilient_collector.nav_retry import (
     interruptible_sleep_seconds,
     is_retryable_primary_failure,
@@ -84,10 +86,15 @@ def _sleep_default(name: str, *, legacy: int, round_robin: int) -> int:
 
 SCHEDULER_MODE = _scheduler_mode()
 CHUNK_SIZE = max(1, _env_int("RESILIENT_CHUNK_SIZE", 10))
+# Alpha Spread locks after 1–2 views in one session; keep chunks at 1 by default.
+ALPHASPREAD_CHUNK_SIZE = max(1, _env_int("RESILIENT_ALPHASPREAD_CHUNK_SIZE", 1))
 
 BASELINE_SLEEP_SECONDS = _sleep_default(
     "RESILIENT_SLEEP_BASELINE_SECONDS", legacy=8, round_robin=4
 )
+# Proven Aug 13 pacing: 8s between isolated Alpha Spread browsers (not the 4s round-robin baseline).
+ALPHASPREAD_SLEEP_SECONDS = _env_int("RESILIENT_ALPHASPREAD_SLEEP_SECONDS", 8)
+ALPHASPREAD_JOB_TIMEOUT_SECONDS = _env_int("RESILIENT_ALPHASPREAD_JOB_TIMEOUT_SECONDS", 120)
 GURUFOCUS_SLEEP_SECONDS = _sleep_default(
     "RESILIENT_GURUFOCUS_SLEEP_SECONDS", legacy=90, round_robin=20
 )
@@ -127,6 +134,20 @@ _YAHOO_KIND_BY_SOURCE: dict[SourceKey, str] = {
 }
 
 
+def _jittered_seconds(base: int, fraction: float = 0.25) -> int:
+    """Integer delay with ±fraction jitter; mean stays near *base*."""
+    if base <= 0:
+        return 0
+    return max(1, int(round(apply_jitter(float(base), fraction))))
+
+
+@dataclass
+class BrowserHolder:
+    browser: Browser | None = None
+    context: BrowserContext | None = None
+    page: Page | None = None
+
+
 def browser_headless() -> bool:
     return env_bool("RESILIENT_HEADLESS", False)
 
@@ -151,6 +172,8 @@ class SheetJobResult:
 
 
 def compliance_sleep_seconds(source: SourceKey | None = None) -> int:
+    if source == "alphaspread":
+        return _jittered_seconds(ALPHASPREAD_SLEEP_SECONDS)
     if source == "gurufocus":
         return GURUFOCUS_SLEEP_SECONDS
     if source == "valueinvesting":
@@ -296,7 +319,12 @@ async def process_ticker(ticker: str, proxy_pool: list[ProxyConfig]) -> TickerRe
         await teardown(page, context, browser, ticker)
 
 
-async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerResult:
+async def process_job(
+    job: ScrapeJob,
+    proxy_pool: list[ProxyConfig],
+    *,
+    holder: BrowserHolder | None = None,
+) -> TickerResult:
     proxy = random.choice(proxy_pool)
     logger.info(
         "[orchestrator] row=%d %s %s selected route %s",
@@ -313,8 +341,14 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=browser_headless())
+            if holder is not None:
+                holder.browser = browser
             context = await create_isolated_context(browser, proxy)
+            if holder is not None:
+                holder.context = context
             page = await context.new_page()
+            if holder is not None:
+                holder.page = page
             await apply_stealth(page)
 
             try:
@@ -342,6 +376,9 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
                     transient=is_retryable_primary_failure(primary_exc),
                 )
 
+    except asyncio.CancelledError:
+        logger.warning("[%s] %s scrape cancelled (watchdog or shutdown)", job.ticker, job.source)
+        raise
     except Exception as exc:
         logger.error("[%s] %s unrecoverable error: %s", job.ticker, job.source, exc)
         return TickerResult(
@@ -354,6 +391,71 @@ async def process_job(job: ScrapeJob, proxy_pool: list[ProxyConfig]) -> TickerRe
 
     finally:
         await teardown(page, context, browser, job.ticker)
+        if holder is not None:
+            holder.page = None
+            holder.context = None
+            holder.browser = None
+
+
+async def _force_close_holder(holder: BrowserHolder, ticker: str) -> None:
+    await teardown(holder.page, holder.context, holder.browser, ticker)
+    holder.page = None
+    holder.context = None
+    holder.browser = None
+
+
+async def run_alphaspread_job_with_watchdog(
+    job: ScrapeJob,
+    proxy_pool: list[ProxyConfig],
+) -> TickerResult:
+    """Run one isolated Alpha Spread job with a hard wall-clock timeout."""
+    holder = BrowserHolder()
+    task = asyncio.create_task(process_job(job, proxy_pool, holder=holder))
+    done, _pending = await asyncio.wait(
+        {task}, timeout=ALPHASPREAD_JOB_TIMEOUT_SECONDS
+    )
+    if task in done:
+        return task.result()
+
+    logger.warning("WATCHDOG TIMEOUT: %s — killed and requeued", job.ticker)
+    task.cancel()
+    try:
+        await asyncio.wait_for(_force_close_holder(holder, job.ticker), timeout=10)
+    except Exception as exc:
+        logger.warning("[%s] watchdog browser kill: %s", job.ticker, exc)
+    try:
+        await asyncio.wait_for(task, timeout=15)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        logger.warning(
+            "[%s] watchdog: cancelled scrape still pending; dropping task",
+            job.ticker,
+        )
+    except Exception as exc:
+        logger.debug("[%s] watchdog cancelled task: %s", job.ticker, exc)
+    return TickerResult(
+        ticker=job.ticker,
+        success=False,
+        source="watchdog",
+        error="watchdog timeout",
+        transient=True,
+    )
+
+
+async def _await_with_watchdog(coro, *, ticker: str, source: str):
+    """Cancel a per-ticker scrape if it exceeds the job timeout (shared sessions)."""
+    task = asyncio.create_task(coro)
+    done, _pending = await asyncio.wait(
+        {task}, timeout=ALPHASPREAD_JOB_TIMEOUT_SECONDS
+    )
+    if task in done:
+        return task.result()
+    logger.warning("WATCHDOG TIMEOUT: %s source=%s — cancelled", ticker, source)
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=15)
+    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+        pass
+    return None
 
 
 async def run_collector(tickers: list[str]) -> list[TickerResult]:
@@ -533,7 +635,28 @@ async def process_gurufocus_jobs(
                 index,
                 total,
             )
-            result = await _process_gurufocus_with_session(job, session)
+            result = await _await_with_watchdog(
+                _process_gurufocus_with_session(job, session),
+                ticker=job.ticker,
+                source="gurufocus",
+            )
+            if result is None:
+                logger.warning(
+                    "[%s] GuruFocus watchdog timeout; rotating identity",
+                    job.ticker,
+                )
+                try:
+                    await session.rotate_identity()
+                except Exception as rotate_exc:
+                    logger.warning("[%s] GuruFocus rotate after watchdog: %s", job.ticker, rotate_exc)
+                result = TickerResult(
+                    ticker=job.ticker,
+                    success=False,
+                    source="watchdog",
+                    proxy=session.proxy_label,
+                    error="watchdog timeout",
+                    transient=True,
+                )
             logger.info(
                 "[result] ticker=%s success=%s source=%s metric=%s error=%s transient=%s",
                 result.ticker,
@@ -695,7 +818,20 @@ async def process_valueinvesting_jobs(
             index,
             total,
         )
-        result = await _process_valueinvesting_with_session(job, session)
+        result = await _await_with_watchdog(
+            _process_valueinvesting_with_session(job, session),
+            ticker=job.ticker,
+            source="valueinvesting",
+        )
+        if result is None:
+            result = TickerResult(
+                ticker=job.ticker,
+                success=False,
+                source="watchdog",
+                proxy=session.proxy_label,
+                error="watchdog timeout",
+                transient=True,
+            )
         logger.info(
             "[result] ticker=%s success=%s source=%s metric=%s error=%s transient=%s",
             result.ticker,
@@ -909,68 +1045,138 @@ async def _process_job_on_page(
         )
 
 
+def _is_alphaspread_restricted(result: TickerResult) -> bool:
+    """True when Alpha Spread refused the page (403/429), not a selector miss."""
+    if result.success:
+        return False
+    err = (result.error or "").lower()
+    return "403" in err or "429" in err or "restrictive or unstable status" in err
+
+
+def _is_alphaspread_watchdog(result: TickerResult) -> bool:
+    return (not result.success) and "watchdog timeout" in (result.error or "").lower()
+
+
+def _sync_guard_progress(
+    shutdown: ShutdownController | None, guard: AlphaSpreadGuard
+) -> None:
+    if shutdown is not None:
+        shutdown.progress.extra = guard.status_line()
+
+
+def _note_alphaspread_outcome(
+    job: ScrapeJob,
+    result: TickerResult,
+    guard: AlphaSpreadGuard,
+    job_cache: dict[tuple[str, SourceKey], TickerResult],
+) -> None:
+    key = (job.ticker, job.source)
+    if result.success:
+        job_cache[key] = result
+        guard.clear_attempts(job)
+        return
+    if _is_alphaspread_restricted(result) or _is_alphaspread_watchdog(result):
+        job_cache.pop(key, None)
+        err = (result.error or "").lower()
+        if _is_alphaspread_watchdog(result):
+            reason = "watchdog"
+        elif "429" in err:
+            reason = "429"
+        else:
+            reason = "403"
+        guard.enqueue_retry(job, reason)
+        return
+    job_cache[key] = result
+
+
+def _has_non_as_work(queues: dict[str, deque]) -> bool:
+    return any(name != "alphaspread" and len(q) > 0 for name, q in queues.items())
+
+
+def _inject_due_retries(queues: dict[str, deque], guard: AlphaSpreadGuard) -> None:
+    for job in reversed(guard.due_jobs()):
+        queues["alphaspread"].appendleft(job)
+        logger.info(
+            "[alphaspread] re-injected retry ticker=%s row=%d",
+            job.ticker,
+            job.row,
+        )
+
+
+def _return_jobs_to_queue(queue: deque | None, jobs: list[ScrapeJob]) -> None:
+    if queue is None or not jobs:
+        return
+    for job in reversed(jobs):
+        queue.appendleft(job)
+
+
 async def _process_alphaspread_chunk(
     jobs: list[ScrapeJob],
     proxy_pool: list[ProxyConfig],
     *,
     shutdown: ShutdownController | None = None,
     round_num: int = 0,
+    leftover_queue: deque | None = None,
 ) -> AsyncIterator[tuple[ScrapeJob, TickerResult]]:
+    """One isolated browser per ticker (Aug 13 working pattern).
+
+    403/429 stops the rest of this chunk (jobs go back on the normal queue).
+    Same-run retry of the failed ticker is handled by AlphaSpreadGuard.
+    """
     if not jobs:
         return
 
-    proxy = random.choice(proxy_pool)
-    browser: Browser | None = None
-    context: BrowserContext | None = None
-    page: Page | None = None
     total = len(jobs)
+    for index, job in enumerate(jobs, start=1):
+        if shutdown is not None and shutdown.is_requested():
+            _return_jobs_to_queue(leftover_queue, jobs[index - 1 :])
+            break
+        if shutdown is not None:
+            shutdown.note_job(
+                row=job.row,
+                ticker=job.ticker,
+                source=job.source,
+                batch=f"AS-round{round_num}",
+                batch_index=index,
+                batch_total=total,
+            )
+        logger.info(
+            "[sheet] Processing row=%d ticker=%s source=alphaspread col=%s "
+            "(round %d AS %d/%d isolated-browser)",
+            job.row,
+            job.ticker,
+            job.value_col,
+            round_num,
+            index,
+            total,
+        )
+        result = await run_alphaspread_job_with_watchdog(job, proxy_pool)
+        logger.info(
+            "[result] ticker=%s success=%s source=%s metric=%s error=%s",
+            result.ticker,
+            result.success,
+            result.source,
+            result.metric,
+            result.error,
+        )
+        yield job, result
+        if shutdown is not None:
+            shutdown.note_job_completed()
 
-    try:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=browser_headless())
-            context = await create_isolated_context(browser, proxy)
-            page = await context.new_page()
-            await apply_stealth(page)
+        if _is_alphaspread_restricted(result):
+            leftover = jobs[index:]
+            logger.warning(
+                "[alphaspread] Restricted response on %s; deferring %d remaining "
+                "job(s) this chunk",
+                job.ticker,
+                len(leftover),
+            )
+            _return_jobs_to_queue(leftover_queue, leftover)
+            break
 
-            for index, job in enumerate(jobs, start=1):
-                if shutdown is not None and shutdown.is_requested():
-                    break
-                if shutdown is not None:
-                    shutdown.note_job(
-                        row=job.row,
-                        ticker=job.ticker,
-                        source=job.source,
-                        batch=f"AS-round{round_num}",
-                        batch_index=index,
-                        batch_total=total,
-                    )
-                logger.info(
-                    "[sheet] Processing row=%d ticker=%s source=alphaspread col=%s "
-                    "(round %d AS %d/%d)",
-                    job.row,
-                    job.ticker,
-                    job.value_col,
-                    round_num,
-                    index,
-                    total,
-                )
-                result = await _process_job_on_page(page, job, proxy.label)
-                logger.info(
-                    "[result] ticker=%s success=%s source=%s metric=%s error=%s",
-                    result.ticker,
-                    result.success,
-                    result.source,
-                    result.metric,
-                    result.error,
-                )
-                yield job, result
-                if shutdown is not None:
-                    shutdown.note_job_completed()
-                if index < total:
-                    if not await compliance_sleep("alphaspread", shutdown):
-                        break
-    finally:
-        await teardown(page, context, browser, "alphaspread-chunk")
+        if not await compliance_sleep("alphaspread", shutdown):
+            _return_jobs_to_queue(leftover_queue, jobs[index:])
+            break
 
 
 async def _process_yahoo_group_on_page(
@@ -1080,7 +1286,26 @@ async def _process_yahoo_chunk(
                     index,
                     total,
                 )
-                pairs = await _process_yahoo_group_on_page(page, group, proxy.label)
+                pairs = await _await_with_watchdog(
+                    _process_yahoo_group_on_page(page, group, proxy.label),
+                    ticker=group.ticker,
+                    source="yahoo",
+                )
+                if pairs is None:
+                    pairs = [
+                        (
+                            job,
+                            TickerResult(
+                                ticker=group.ticker,
+                                success=False,
+                                source="watchdog",
+                                proxy=proxy.label,
+                                error="watchdog timeout",
+                                transient=True,
+                            ),
+                        )
+                        for job in group.jobs
+                    ]
                 for job, result in pairs:
                     logger.info(
                         "[result] ticker=%s source=%s success=%s metric=%s error=%s",
@@ -1130,7 +1355,20 @@ async def _process_vi_chunk_with_session(
             index,
             total,
         )
-        result = await _process_valueinvesting_with_session(job, session)
+        result = await _await_with_watchdog(
+            _process_valueinvesting_with_session(job, session),
+            ticker=job.ticker,
+            source="valueinvesting",
+        )
+        if result is None:
+            result = TickerResult(
+                ticker=job.ticker,
+                success=False,
+                source="watchdog",
+                proxy=session.proxy_label,
+                error="watchdog timeout",
+                transient=True,
+            )
         logger.info(
             "[result] ticker=%s success=%s source=%s metric=%s error=%s",
             result.ticker,
@@ -1177,7 +1415,28 @@ async def _process_gf_chunk_with_session(
             index,
             total,
         )
-        result = await _process_gurufocus_with_session(job, session)
+        result = await _await_with_watchdog(
+            _process_gurufocus_with_session(job, session),
+            ticker=job.ticker,
+            source="gurufocus",
+        )
+        if result is None:
+            logger.warning(
+                "[%s] GuruFocus watchdog timeout; rotating identity",
+                job.ticker,
+            )
+            try:
+                await session.rotate_identity()
+            except Exception as rotate_exc:
+                logger.warning("[%s] GuruFocus rotate after watchdog: %s", job.ticker, rotate_exc)
+            result = TickerResult(
+                ticker=job.ticker,
+                success=False,
+                source="watchdog",
+                proxy=session.proxy_label,
+                error="watchdog timeout",
+                transient=True,
+            )
         logger.info(
             "[result] ticker=%s success=%s source=%s metric=%s error=%s",
             result.ticker,
@@ -1202,7 +1461,9 @@ async def _run_legacy_batch_scrape(
     job_cache: dict[tuple[str, SourceKey], TickerResult],
     *,
     shutdown: ShutdownController | None = None,
+    guard: AlphaSpreadGuard | None = None,
 ) -> None:
+    guard = guard or AlphaSpreadGuard()
     vi_jobs, other_jobs = _partition_valueinvesting_jobs(scrape_jobs)
     if vi_jobs and not (shutdown is not None and shutdown.is_requested()):
         logger.info(
@@ -1234,6 +1495,7 @@ async def _run_legacy_batch_scrape(
             results.append(await _apply_job_result(writes, job, result))
 
     total_other = len(other_jobs)
+    skipped_as: list[ScrapeJob] = []
     for index, job in enumerate(other_jobs, start=1):
         if shutdown is not None and shutdown.is_requested():
             logger.warning(
@@ -1246,6 +1508,10 @@ async def _run_legacy_batch_scrape(
             )
             break
 
+        if job.source == "alphaspread" and guard.is_open():
+            skipped_as.append(job)
+            continue
+
         if shutdown is not None:
             shutdown.note_job(
                 row=job.row,
@@ -1255,6 +1521,7 @@ async def _run_legacy_batch_scrape(
                 batch_index=index,
                 batch_total=total_other,
             )
+            _sync_guard_progress(shutdown, guard)
 
         logger.info(
             "[sheet] Processing row=%d ticker=%s source=%s col=%s (%d/%d)",
@@ -1267,9 +1534,13 @@ async def _run_legacy_batch_scrape(
         )
 
         cache_key = (job.ticker, job.source)
-        if cache_key in job_cache:
+        if job.source != "alphaspread" and cache_key in job_cache:
             result = job_cache[cache_key]
             logger.info("[sheet] Reusing cached result for %s %s", job.ticker, job.source)
+        elif job.source == "alphaspread":
+            result = await run_alphaspread_job_with_watchdog(job, proxy_pool)
+            _note_alphaspread_outcome(job, result, guard, job_cache)
+            _sync_guard_progress(shutdown, guard)
         else:
             result = await process_job(job, proxy_pool)
             job_cache[cache_key] = result
@@ -1278,7 +1549,7 @@ async def _run_legacy_batch_scrape(
         if shutdown is not None:
             shutdown.note_job_completed()
 
-        if index < total_other:
+        if index < total_other or skipped_as or guard.pending_retry_count():
             if not await compliance_sleep(job.source, shutdown):
                 logger.warning(
                     "[sheet] Shutdown during post-request pause at %d/%d | row=%d ticker=%s",
@@ -1287,6 +1558,50 @@ async def _run_legacy_batch_scrape(
                     job.row,
                     job.ticker,
                 )
+                break
+
+    as_queue: deque = deque(skipped_as)
+    while as_queue or guard.pending_retry_count():
+        if shutdown is not None and shutdown.is_requested():
+            break
+        _sync_guard_progress(shutdown, guard)
+        for job in reversed(guard.due_jobs()):
+            as_queue.appendleft(job)
+            logger.info(
+                "[alphaspread] re-injected retry ticker=%s row=%d",
+                job.ticker,
+                job.row,
+            )
+        if guard.is_open() or not as_queue:
+            wait = max(1, int(round(guard.seconds_until_ready())) or 1)
+            logger.info("[alphaspread] waiting %ds | %s", wait, guard.status_line())
+            if not await interruptible_sleep(
+                wait, shutdown, label="Alpha Spread retry/breaker wait"
+            ):
+                break
+            continue
+        job = as_queue.popleft()
+        if shutdown is not None:
+            shutdown.note_job(
+                row=job.row,
+                ticker=job.ticker,
+                source=job.source,
+                batch="alphaspread-retry",
+            )
+        logger.info(
+            "[sheet] Processing row=%d ticker=%s source=alphaspread col=%s (retry drain)",
+            job.row,
+            job.ticker,
+            job.value_col,
+        )
+        result = await run_alphaspread_job_with_watchdog(job, proxy_pool)
+        _note_alphaspread_outcome(job, result, guard, job_cache)
+        _sync_guard_progress(shutdown, guard)
+        results.append(await _apply_job_result(writes, job, result))
+        if shutdown is not None:
+            shutdown.note_job_completed()
+        if as_queue or guard.pending_retry_count():
+            if not await compliance_sleep("alphaspread", shutdown):
                 break
 
 
@@ -1298,37 +1613,68 @@ async def _run_round_robin_scrape(
     job_cache: dict[tuple[str, SourceKey], TickerResult],
     *,
     shutdown: ShutdownController | None = None,
+    guard: AlphaSpreadGuard | None = None,
 ) -> None:
+    guard = guard or AlphaSpreadGuard()
     queues = partition_scrape_queues(scrape_jobs)
     logger.info(
-        "[sheet] Round-robin scheduler chunk_size=%d remaining %s",
+        "[sheet] Round-robin scheduler chunk_size=%d alphaspread_chunk=%d remaining %s",
         CHUNK_SIZE,
+        ALPHASPREAD_CHUNK_SIZE,
         queue_remaining_summary(queues),
     )
+    _sync_guard_progress(shutdown, guard)
 
     vi_session = ValueInvestingSession(proxy_pool)
     gf_session = GuruFocusSession(proxy_pool)
     round_num = 0
 
     try:
-        while any_queue_nonempty(queues):
+        while any_queue_nonempty(queues) or guard.pending_retry_count():
             if shutdown is not None and shutdown.is_requested():
                 break
+            _inject_due_retries(queues, guard)
+            _sync_guard_progress(shutdown, guard)
+
+            can_run_as = bool(queues["alphaspread"]) and not guard.is_open()
+            can_run_other = _has_non_as_work(queues)
+            if not can_run_as and not can_run_other:
+                if guard.pending_retry_count() or guard.is_open():
+                    wait = max(1, int(round(guard.seconds_until_ready())) or 1)
+                    logger.info("[alphaspread] waiting %ds | %s", wait, guard.status_line())
+                    if not await interruptible_sleep(
+                        wait, shutdown, label="Alpha Spread retry/breaker wait"
+                    ):
+                        break
+                    continue
+                break
+
             round_num += 1
             logger.info(
-                "[round %d] start | remaining %s",
+                "[round %d] start | remaining %s | %s",
                 round_num,
                 queue_remaining_summary(queues),
+                guard.status_line(),
             )
 
             for source_name in ROUND_ROBIN_ORDER:
                 if shutdown is not None and shutdown.is_requested():
                     break
+                if source_name == "alphaspread" and guard.is_open():
+                    logger.info(
+                        "[round %d] alphaspread skipped | %s",
+                        round_num,
+                        guard.status_line(),
+                    )
+                    continue
                 queue = queues[source_name]
                 if not queue:
                     continue
 
-                chunk = take_chunk(queue, CHUNK_SIZE)
+                chunk_size = (
+                    ALPHASPREAD_CHUNK_SIZE if source_name == "alphaspread" else CHUNK_SIZE
+                )
+                chunk = take_chunk(queue, chunk_size)
                 logger.info(
                     "[round %d] %s chunk=%d | remaining after take %s",
                     round_num,
@@ -1339,9 +1685,14 @@ async def _run_round_robin_scrape(
 
                 if source_name == "alphaspread":
                     async for job, result in _process_alphaspread_chunk(
-                        chunk, proxy_pool, shutdown=shutdown, round_num=round_num
+                        chunk,
+                        proxy_pool,
+                        shutdown=shutdown,
+                        round_num=round_num,
+                        leftover_queue=queue,
                     ):
-                        job_cache[(job.ticker, job.source)] = result
+                        _note_alphaspread_outcome(job, result, guard, job_cache)
+                        _sync_guard_progress(shutdown, guard)
                         results.append(await _apply_job_result(writes, job, result))
                 elif source_name == "valueinvesting":
                     async for job, result in _process_vi_chunk_with_session(
@@ -1363,9 +1714,10 @@ async def _run_round_robin_scrape(
                         results.append(await _apply_job_result(writes, job, result))
 
             logger.info(
-                "[round %d] done | remaining %s",
+                "[round %d] done | remaining %s | %s",
                 round_num,
                 queue_remaining_summary(queues),
+                guard.status_line(),
             )
     finally:
         await vi_session.close()
@@ -1381,14 +1733,20 @@ async def run_sheet_collector(
 ) -> list[SheetJobResult]:
     load_env_file()
     # Re-read scheduler knobs after .env load (module defaults may predate env).
-    global SCHEDULER_MODE, CHUNK_SIZE
-    global BASELINE_SLEEP_SECONDS, GURUFOCUS_SLEEP_SECONDS
+    global SCHEDULER_MODE, CHUNK_SIZE, ALPHASPREAD_CHUNK_SIZE
+    global BASELINE_SLEEP_SECONDS, ALPHASPREAD_SLEEP_SECONDS
+    global ALPHASPREAD_JOB_TIMEOUT_SECONDS, GURUFOCUS_SLEEP_SECONDS
     global VALUEINVESTING_SLEEP_SECONDS, VALUEINVESTING_SLEEP_JITTER_SECONDS
     global YAHOO_SLEEP_SECONDS
     SCHEDULER_MODE = _scheduler_mode()
     CHUNK_SIZE = max(1, _env_int("RESILIENT_CHUNK_SIZE", 10))
+    ALPHASPREAD_CHUNK_SIZE = max(1, _env_int("RESILIENT_ALPHASPREAD_CHUNK_SIZE", 1))
     BASELINE_SLEEP_SECONDS = _sleep_default(
         "RESILIENT_SLEEP_BASELINE_SECONDS", legacy=8, round_robin=4
+    )
+    ALPHASPREAD_SLEEP_SECONDS = _env_int("RESILIENT_ALPHASPREAD_SLEEP_SECONDS", 8)
+    ALPHASPREAD_JOB_TIMEOUT_SECONDS = _env_int(
+        "RESILIENT_ALPHASPREAD_JOB_TIMEOUT_SECONDS", 120
     )
     GURUFOCUS_SLEEP_SECONDS = _sleep_default(
         "RESILIENT_GURUFOCUS_SLEEP_SECONDS", legacy=90, round_robin=20
@@ -1415,17 +1773,21 @@ async def run_sheet_collector(
     scrape_jobs = [job for job in jobs if not job.clear_only]
     logger.info(
         "[sheet] Processing %d jobs (%d scrape, %d non-US clear) dry_run=%s "
-        "scheduler=%s chunk_size=%d sleeps=gf:%ds vi:%ds baseline:%ds yahoo:%ds",
+        "scheduler=%s chunk_size=%d alphaspread_chunk=%d "
+        "sleeps=as:%ds gf:%ds vi:%ds baseline:%ds yahoo:%ds as_timeout:%ds",
         len(jobs),
         len(scrape_jobs),
         len(clear_jobs),
         dry_run,
         SCHEDULER_MODE,
         CHUNK_SIZE,
+        ALPHASPREAD_CHUNK_SIZE,
+        ALPHASPREAD_SLEEP_SECONDS,
         GURUFOCUS_SLEEP_SECONDS,
         VALUEINVESTING_SLEEP_SECONDS,
         BASELINE_SLEEP_SECONDS,
         YAHOO_SLEEP_SECONDS,
+        ALPHASPREAD_JOB_TIMEOUT_SECONDS,
     )
     for job in jobs:
         logger.info(
@@ -1450,6 +1812,8 @@ async def run_sheet_collector(
     proxy_pool = await build_validated_pool()
     results: list[SheetJobResult] = []
     job_cache: dict[tuple[str, SourceKey], TickerResult] = {}
+    guard = AlphaSpreadGuard()
+    _sync_guard_progress(shutdown, guard)
 
     try:
         for job in clear_jobs:
@@ -1469,6 +1833,7 @@ async def run_sheet_collector(
                 results,
                 job_cache,
                 shutdown=shutdown,
+                guard=guard,
             )
         else:
             await _run_round_robin_scrape(
@@ -1478,6 +1843,7 @@ async def run_sheet_collector(
                 results,
                 job_cache,
                 shutdown=shutdown,
+                guard=guard,
             )
     finally:
         await writes.close()
