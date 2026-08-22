@@ -13,6 +13,7 @@ from config import (
     MISSING_VALUE_START_ROW,
     SHEET_ID,
     SHEET_URL,
+    SheetColumnBlock,
     WORKSHEET_MISSING_VALUE,
 )
 from credentials import get_credentials
@@ -29,6 +30,46 @@ from sheet_utils import (
 logger = logging.getLogger(__name__)
 
 _HEADER_TICKERS = frozenset({"STOCK NAME", "TICKER", "SYMBOL"})
+
+
+def _cell_text(row: list, col_letter: str, *, upper: bool = False) -> str:
+    idx = col_letter_to_index(col_letter) - 1
+    if idx < 0 or idx >= len(row):
+        return ""
+    text = str(row[idx]).strip()
+    return text.upper() if upper else text
+
+
+def resolve_row_ticker(
+    row: list,
+    block: SheetColumnBlock,
+    blocks: tuple[SheetColumnBlock, ...] = MISSING_VALUE_BLOCKS,
+) -> str:
+    """Use this source's ticker column, else another filled ticker on the same row (C/N)."""
+    ticker = _cell_text(row, block.ticker_col, upper=True)
+    if ticker and ticker not in _HEADER_TICKERS:
+        return ticker
+    for other in blocks:
+        candidate = _cell_text(row, other.ticker_col, upper=True)
+        if candidate and candidate not in _HEADER_TICKERS:
+            return candidate
+    return ""
+
+
+def resolve_row_index(
+    row: list,
+    block: SheetColumnBlock,
+    blocks: tuple[SheetColumnBlock, ...] = MISSING_VALUE_BLOCKS,
+) -> str:
+    """Use this source's index column, else another filled index on the same row (B/M)."""
+    index_cell = _cell_text(row, block.index_col)
+    if index_cell:
+        return index_cell
+    for other in blocks:
+        candidate = _cell_text(row, other.index_col)
+        if candidate:
+            return candidate
+    return ""
 
 
 def _refresh_all_cells() -> bool:
@@ -59,6 +100,8 @@ class DcfSheetClient:
 
         US (Nasdaq/NYSE): scrape every value column (missing or existing).
         Non-US: skip scraping; queue clear-only jobs when a stale value exists.
+        If a source ticker/index cell is empty, reuse another filled ticker/index
+        on the same row (typically Alpha Spread C/B or GuruFocus N/M).
         """
         jobs: list[ScrapeJob] = []
         refresh_all = _refresh_all_cells()
@@ -66,7 +109,9 @@ class DcfSheetClient:
         skipped_non_us_empty = 0
         clear_non_us = 0
         skipped_completed = 0
-        
+        ticker_fallbacks = 0
+        index_fallbacks = 0
+
         completed_cache = {}
         for block in MISSING_VALUE_BLOCKS:
             completed_cache[block.source] = get_completed_rows(block.source)
@@ -79,23 +124,23 @@ class DcfSheetClient:
         for row_num in range(start_row, max_row + 1):
             row = all_values[row_num - 1]
             for block in MISSING_VALUE_BLOCKS:
-                index_idx = col_letter_to_index(block.index_col) - 1
-                ticker_idx = col_letter_to_index(block.ticker_col) - 1
                 value_idx = col_letter_to_index(block.value_col) - 1
 
-                ticker = ""
-                if ticker_idx < len(row):
-                    ticker = str(row[ticker_idx]).strip().upper()
+                own_ticker = _cell_text(row, block.ticker_col, upper=True)
+                ticker = resolve_row_ticker(row, block)
                 if not ticker or ticker in _HEADER_TICKERS:
                     continue
+                if own_ticker != ticker:
+                    ticker_fallbacks += 1
 
                 current_value = ""
                 if value_idx < len(row):
                     current_value = str(row[value_idx]).strip()
 
-                index_cell = ""
-                if index_idx < len(row):
-                    index_cell = str(row[index_idx]).strip()
+                own_index = _cell_text(row, block.index_col)
+                index_cell = resolve_row_index(row, block)
+                if own_index != index_cell:
+                    index_fallbacks += 1
                 security_type = normalize_security_type(index_cell)
 
                 if not is_us_market_index(index_cell):
@@ -143,13 +188,16 @@ class DcfSheetClient:
 
         logger.info(
             "Queued %d jobs (%d scrape, %d non-US clear, %d skipped existing, "
-            "%d skipped completed, %d non-US empty skipped) refresh_mode=%s",
+            "%d skipped completed, %d non-US empty skipped, "
+            "%d ticker fallbacks, %d index fallbacks) refresh_mode=%s",
             len(jobs),
             len(jobs) - clear_non_us,
             clear_non_us,
             skipped_existing,
             skipped_completed,
             skipped_non_us_empty,
+            ticker_fallbacks,
+            index_fallbacks,
             os.environ.get("RESILIENT_REFRESH_MODE", "all"),
         )
         return jobs
