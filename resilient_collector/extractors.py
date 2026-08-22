@@ -275,30 +275,11 @@ def get_exchange_for_ticker(ticker: str) -> str:
 
 
 async def _alpha_css(page: Page) -> str | None:
-    # 1. Livewire DCF base-case control (colon in attr must be escaped for CSS)
-    loc = page.locator('a[wire\\:key*="dcf-base-case"] div.detail').first
-    if await loc.count() > 0:
-        val = await loc.inner_text(timeout=2000)
-        if val.strip():
-            return val.strip()
-
-    # XPath fallback if CSS attribute escaping differs across engines
-    xpath_loc = page.locator(
-        "xpath=//a[contains(@*[name()='wire:key'], 'dcf-base-case')]//div[contains(@class,'detail')]"
-    ).first
-    if await xpath_loc.count() > 0:
-        val = await xpath_loc.inner_text(timeout=2000)
-        if val.strip():
-            return val.strip()
-
-    # 2. Next check the legacy selector as a fallback for the summary page
+    # July 30 selectors (285c63c). Do not prefer Livewire wire:key / dcf-base-case —
+    # that path caused extractor errors. Isolated browser + 8s pause is in orchestrator.
     summary_loc = page.locator("a.intrinsic-value-dcf-link div.detail").first
     if await summary_loc.count() > 0:
-        val = await summary_loc.inner_text(timeout=2000)
-        if val.strip():
-            return val.strip()
-
-    # 3. Target the first occurrence of pure DCF valuation element on dcf page fallback
+        return await summary_loc.inner_text(timeout=5000)
     loc = page.locator('div[class*="valuation-value"], div[class*="valuation-scenario-value"]').first
     if await loc.count() > 0:
         return await loc.inner_text(timeout=5000)
