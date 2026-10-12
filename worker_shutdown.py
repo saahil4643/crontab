@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 import logging
 import os
 import signal
@@ -44,19 +47,89 @@ class WorkerProgress:
         )
 
 
-@dataclass
 class ShutdownController:
-    event: asyncio.Event = field(default_factory=asyncio.Event)
-    reason: str | None = None
-    progress: WorkerProgress = field(default_factory=WorkerProgress)
+    """Graceful shutdown controller with lazy, loop-aware asyncio.Event binding.
+
+    In Python <= 3.9, creating an asyncio.Event outside an active loop binds it to
+    the thread's default loop. When asyncio.run() later starts a new event loop,
+    awaiting that event raises:
+        RuntimeError: Task <...> got Future <...> attached to a different loop.
+    This controller dynamically binds or rebinds the event to the active running loop.
+    """
+
+    def __init__(
+        self,
+        event: asyncio.Event | None = None,
+        reason: str | None = None,
+        progress: WorkerProgress | None = None,
+    ) -> None:
+        self._event = event
+        self._loop: asyncio.AbstractEventLoop | None = (
+            getattr(event, "_loop", None) if event is not None else None
+        )
+        self.reason = reason
+        self.progress = progress if progress is not None else WorkerProgress()
+        self._requested: bool = False
+
+    @property
+    def event(self) -> asyncio.Event:
+        """Return an asyncio.Event bound to the currently running event loop."""
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if self._event is None:
+            self._event = asyncio.Event()
+            self._loop = current_loop
+            if self._requested:
+                self._event.set()
+        elif current_loop is not None:
+            event_loop = getattr(self._event, "_loop", None) or self._loop
+            if event_loop is not current_loop:
+                was_set = self._requested or self._event.is_set()
+                self._event = asyncio.Event()
+                self._loop = current_loop
+                if was_set:
+                    self._event.set()
+        return self._event
+
+    @event.setter
+    def event(self, value: asyncio.Event) -> None:
+        self._event = value
+        self._loop = getattr(value, "_loop", None)
+        if self._requested:
+            self._event.set()
 
     def request_shutdown(self, reason: str) -> None:
         if self.reason is None:
             self.reason = reason
-        self.event.set()
+        self._requested = True
+        if self._event is not None:
+            target_loop = getattr(self._event, "_loop", None) or self._loop
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if (
+                target_loop is not None
+                and target_loop.is_running()
+                and running_loop is not target_loop
+            ):
+                target_loop.call_soon_threadsafe(self._event.set)
+            else:
+                self._event.set()
 
     def is_requested(self) -> bool:
-        return self.event.is_set()
+        return self._requested or (self._event is not None and self._event.is_set())
+
+    def reset(self) -> None:
+        """Reset state if reusing the controller across separate runs."""
+        self._requested = False
+        self.reason = None
+        self._event = None
+        self._loop = None
 
     def note_job(
         self,
@@ -122,22 +195,26 @@ def install_signal_handlers(shutdown: ShutdownController, logger: logging.Logger
     ):
         try:
             loop.add_signal_handler(sig, _handle, signame)
-        except NotImplementedError:
-            # Windows / limited platforms
-            signal.signal(sig, lambda _num, _frame, name=signame: _handle(name))
+        except (NotImplementedError, RuntimeError):
+            # Windows / limited platforms or non-main thread execution
+            try:
+                signal.signal(sig, lambda _num, _frame, name=signame: _handle(name))
+            except (ValueError, OSError):
+                pass
 
 
 async def heartbeat_loop(logger: logging.Logger, shutdown: ShutdownController) -> None:
     while not shutdown.is_requested():
+        interval = float(os.environ.get("RESILIENT_HEARTBEAT_SECONDS", str(HEARTBEAT_INTERVAL_SECONDS)))
         try:
-            await asyncio.wait_for(shutdown.event.wait(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+            await asyncio.wait_for(shutdown.event.wait(), timeout=interval)
             return
         except asyncio.TimeoutError:
             logger.info("RUN_HEARTBEAT | %s", shutdown.progress.snapshot())
 
 
 async def interruptible_sleep(
-    seconds: int,
+    seconds: float | int,
     shutdown: ShutdownController | None,
     *,
     label: str = "pause",
@@ -205,6 +282,8 @@ def acquire_instance_lock(lock_file: os.PathLike[str]) -> int | None:
     path = os.fspath(lock_file)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    if fcntl is None:
+        return fd
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -217,6 +296,7 @@ def release_instance_lock(lock_fd: int | None) -> None:
     if lock_fd is None:
         return
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
     finally:
         os.close(lock_fd)

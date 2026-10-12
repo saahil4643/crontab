@@ -170,7 +170,9 @@ async def _run_worker(args: argparse.Namespace, shutdown: ShutdownController) ->
             await heartbeat_task
 
 
-def run_worker(args: argparse.Namespace, shutdown: ShutdownController) -> int:
+def run_worker(args: argparse.Namespace, shutdown: ShutdownController | None = None) -> int:
+    if shutdown is None:
+        shutdown = ShutdownController()
     started = time.time()
     worker_logger.info(
         "RUN_START | dry_run=%s | limit=%s | sources=%s | pid=%s",
