@@ -9,9 +9,13 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from datetime import datetime, timezone
 from contextlib import suppress
 from pathlib import Path
+
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"google.*")
+warnings.filterwarnings("ignore", message=r".*Python version 3\.9.*", category=FutureWarning)
 
 from config import SourceKey, validate_config
 from logging_setup import setup_logging
@@ -132,6 +136,7 @@ def start_background(argv: list[str]) -> int:
     child_args = [arg for arg in argv if arg != "--background"]
     command = [sys.executable, str(Path(__file__).resolve()), *child_args]
     env = os.environ.copy()
+    env["RESILIENT_BACKGROUND"] = "1"
     parser = build_parser()
     args = parser.parse_args(argv)
     if should_use_xvfb(args):
@@ -236,6 +241,7 @@ if __name__ == "__main__":
             status = "refused"
             failure_reason = f"already_running pid={running_pid}"
             exit_code = 1
+            worker_logger.warning("Worker refused: %s", failure_reason)
             log_run_summary(
                 worker_logger,
                 status=status,
@@ -250,6 +256,7 @@ if __name__ == "__main__":
             status = "refused"
             failure_reason = "instance_lock_busy"
             exit_code = 1
+            worker_logger.warning("Worker refused: %s", failure_reason)
             log_run_summary(
                 worker_logger,
                 status=status,

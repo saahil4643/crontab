@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +20,7 @@ log_run_banner = _jl.log_run_banner
 _worker_logger = logging.getLogger("cron62.worker")
 
 
-def setup_logging(*, also_stdout: bool = False) -> tuple[logging.Logger, str]:
+def setup_logging(*, also_stdout: bool | None = None) -> tuple[logging.Logger, str]:
     """
     Configure cron-62 worker logging.
 
@@ -28,6 +29,11 @@ def setup_logging(*, also_stdout: bool = False) -> tuple[logging.Logger, str]:
     """
     global _worker_logger
 
+    if also_stdout is None:
+        # Default to True for interactive runs; avoid duplicate logging in background daemon mode
+        is_bg = os.environ.get("RESILIENT_BACKGROUND") == "1"
+        also_stdout = not is_bg
+
     _worker_logger, log_path, run_id = configure_job_logger(
         "cron62.worker",
         JOB_NAME,
@@ -35,8 +41,6 @@ def setup_logging(*, also_stdout: bool = False) -> tuple[logging.Logger, str]:
         role="worker",
         also_stdout=False,
     )
-    log_run_banner(_worker_logger, JOB_NAME, "worker")
-    _worker_logger.info("worker log_file=%s", log_path)
 
     fmt = logging.Formatter(
         f"%(asctime)s | {JOB_NAME} | worker | run={run_id} | %(levelname)s | %(message)s"
@@ -52,8 +56,12 @@ def setup_logging(*, also_stdout: bool = False) -> tuple[logging.Logger, str]:
     root.addHandler(file_handler)
 
     if also_stdout:
-        stream_handler = logging.StreamHandler(sys.stdout)
+        target_stream = sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
+        stream_handler = logging.StreamHandler(target_stream)
         stream_handler.setFormatter(fmt)
         root.addHandler(stream_handler)
+
+    log_run_banner(_worker_logger, JOB_NAME, "worker")
+    _worker_logger.info("worker log_file=%s", log_path)
 
     return _worker_logger, log_path

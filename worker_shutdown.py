@@ -250,9 +250,19 @@ def read_pid_file(pid_file: os.PathLike[str]) -> int | None:
 def is_process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    # On Linux, inspect /proc/{pid}/cmdline to guard against stale PIDs recycled by unrelated processes
+    cmdline_path = f"/proc/{pid}/cmdline"
+    if os.path.exists(cmdline_path):
+        try:
+            with open(cmdline_path, "rb") as f:
+                cmd = f.read().decode("utf-8", errors="ignore")
+                if cmd and not any(sig in cmd for sig in ("python", "resilient", "xvfb")):
+                    return False
+        except OSError:
+            pass
+    return True
 
 
 def existing_worker_pid(pid_file: os.PathLike[str]) -> int | None:

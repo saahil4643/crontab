@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"google.*")
+warnings.filterwarnings("ignore", message=r".*Python version 3\.9.*", category=FutureWarning)
 
 import gspread
 from gspread import Worksheet

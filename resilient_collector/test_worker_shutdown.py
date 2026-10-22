@@ -219,5 +219,38 @@ class LinuxFcntlLockTests(unittest.TestCase):
                     os.unlink(tmp_path)
 
 
+class LoggingAndProcessAliveTests(unittest.TestCase):
+    def test_setup_logging_streams_to_stdout_by_default(self) -> None:
+        from logging_setup import setup_logging
+        import logging
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RESILIENT_BACKGROUND", None)
+            logger, log_path = setup_logging()
+            handlers = logging.getLogger().handlers
+            has_stream = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in handlers)
+            self.assertTrue(has_stream)
+
+    def test_setup_logging_disables_stdout_in_background(self) -> None:
+        from logging_setup import setup_logging
+        import logging
+
+        with patch.dict(os.environ, {"RESILIENT_BACKGROUND": "1"}):
+            logger, log_path = setup_logging()
+            handlers = logging.getLogger().handlers
+            has_stream = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in handlers)
+            self.assertFalse(has_stream)
+
+    def test_is_process_alive_cmdline_filtering(self) -> None:
+        from worker_shutdown import is_process_alive
+
+        with patch("os.kill", return_value=None), patch("os.path.exists", return_value=True):
+            with patch("builtins.open", unittest.mock.mock_open(read_data=b"/usr/bin/nginx")):
+                self.assertFalse(is_process_alive(1234))
+
+            with patch("builtins.open", unittest.mock.mock_open(read_data=b"python run_resilient_sheet.py")):
+                self.assertTrue(is_process_alive(1234))
+
+
 if __name__ == "__main__":
     unittest.main()
