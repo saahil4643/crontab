@@ -48,6 +48,7 @@ from sheet_client import DcfSheetClient
 from sheet_utils import has_stored_cell_value
 from sheet_write_buffer import SheetWriteBuffer
 from worker_shutdown import ShutdownController, interruptible_sleep
+from resilient_collector.grok_collector import fetch_metric_from_grok, grok_is_configured
 
 logger = logging.getLogger(__name__)
 
@@ -244,8 +245,9 @@ async def retry_sync(label: str, func, *args):
                 break
             delay = SHEET_RETRY_BASE_SECONDS * attempt
             logger.warning("%s failed attempt %d/%d: %s; retrying in %.1fs", label, attempt, SHEET_RETRY_ATTEMPTS, exc, delay)
-            await asyncio.sleep(delay)
-    raise last_error
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{label} failed with no attempts executed")
 
 
 async def teardown(page: Page | None, context: BrowserContext | None, browser: Browser | None, ticker: str) -> None:
@@ -338,6 +340,27 @@ async def process_job(
     context: BrowserContext | None = None
     page: Page | None = None
 
+    grok_primary_sources = {
+        s.strip().lower()
+        for s in os.environ.get("GROK_PRIMARY_FOR", "").split(",")
+        if s.strip()
+    }
+    if grok_is_configured() and job.source in grok_primary_sources:
+        logger.info(
+            "[%s] Fetching %s metric directly via Grok AI (configured in GROK_PRIMARY_FOR)...",
+            job.ticker,
+            job.source,
+        )
+        grok_val = await fetch_metric_from_grok(job.ticker, job.source)
+        if grok_val:
+            return TickerResult(
+                ticker=job.ticker,
+                success=True,
+                source=f"grok_ai_{job.source}",
+                metric=grok_val,
+                proxy="xai_grok",
+            )
+
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=browser_headless())
@@ -367,6 +390,21 @@ async def process_job(
                     job.source,
                     primary_exc,
                 )
+                if grok_is_configured():
+                    logger.info(
+                        "[%s] Attempting Grok AI web search fallback for %s...",
+                        job.ticker,
+                        job.source,
+                    )
+                    grok_val = await fetch_metric_from_grok(job.ticker, job.source)
+                    if grok_val:
+                        return TickerResult(
+                            ticker=job.ticker,
+                            success=True,
+                            source=f"grok_ai_{job.source}",
+                            metric=grok_val,
+                            proxy="xai_grok",
+                        )
                 return TickerResult(
                     ticker=job.ticker,
                     success=False,
@@ -1019,6 +1057,27 @@ async def _process_job_on_page(
     job: ScrapeJob,
     proxy_label: str,
 ) -> TickerResult:
+    grok_primary_sources = {
+        s.strip().lower()
+        for s in os.environ.get("GROK_PRIMARY_FOR", "").split(",")
+        if s.strip()
+    }
+    if grok_is_configured() and job.source in grok_primary_sources:
+        logger.info(
+            "[%s] Fetching %s metric directly via Grok AI (configured in GROK_PRIMARY_FOR)...",
+            job.ticker,
+            job.source,
+        )
+        grok_val = await fetch_metric_from_grok(job.ticker, job.source)
+        if grok_val:
+            return TickerResult(
+                ticker=job.ticker,
+                success=True,
+                source=f"grok_ai_{job.source}",
+                metric=grok_val,
+                proxy="xai_grok",
+            )
+
     try:
         primary = await extract_primary_metric_for_job(page, job)
         return TickerResult(
@@ -1035,6 +1094,21 @@ async def _process_job_on_page(
             job.source,
             primary_exc,
         )
+        if grok_is_configured():
+            logger.info(
+                "[%s] Attempting Grok AI web search fallback for %s...",
+                job.ticker,
+                job.source,
+            )
+            grok_val = await fetch_metric_from_grok(job.ticker, job.source)
+            if grok_val:
+                return TickerResult(
+                    ticker=job.ticker,
+                    success=True,
+                    source=f"grok_ai_{job.source}",
+                    metric=grok_val,
+                    proxy="xai_grok",
+                )
         return TickerResult(
             ticker=job.ticker,
             success=False,
