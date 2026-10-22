@@ -78,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="List sheet jobs without scraping or writing")
     parser.add_argument("--limit", type=int, default=None, help="Max sheet jobs to process")
     parser.add_argument("--source", action="append", dest="sources", metavar="SOURCE", help="Sheet source to process; repeatable")
+    parser.add_argument("--reset-progress", action="store_true", help="Clear cycle_progress.json to re-process all rows")
     return parser
 
 
@@ -215,6 +216,10 @@ if __name__ == "__main__":
 
     if args.background:
         raise SystemExit(start_background(sys.argv[1:]))
+
+    if args.reset_progress:
+        from resilient_collector.progress_tracker import clear_progress
+        clear_progress()
 
     maybe_reexec_with_xvfb(args)
 
