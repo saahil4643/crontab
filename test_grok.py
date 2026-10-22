@@ -49,12 +49,15 @@ async def main_async() -> int:
     ticker = args.ticker.strip().upper()
     source = args.source.strip().lower()
 
+    key = get_grok_api_key()
+    preview = f"{key[:8]}...{key[-4:]} (len: {len(key)})" if len(key) > 12 else f"'{key}' (len: {len(key)})"
+
     print("=" * 65)
     print(f"[*] Testing Grok API Valuation Extractor")
     print(f"[*] Target Ticker: {ticker}")
     print(f"[*] Valuation Source: {source}")
     print(f"[*] Model: {os.environ.get('GROK_MODEL', DEFAULT_GROK_MODEL)}")
-    print(f"[*] API Key Present: {'YES' if grok_is_configured() else 'NO'}")
+    print(f"[*] API Key: {preview if key else 'NOT FOUND'}")
     print("=" * 65)
 
     if not grok_is_configured():

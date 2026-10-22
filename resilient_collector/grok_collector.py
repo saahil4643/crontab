@@ -18,11 +18,14 @@ DEFAULT_GROK_MODEL = "grok-2-latest"
 
 def get_grok_api_key() -> str:
     """Return the configured xAI / Grok API key, if any."""
-    return (
+    raw = (
         os.environ.get("XAI_API_KEY")
         or os.environ.get("GROK_API_KEY")
         or ""
     ).strip()
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
+    return raw
 
 
 def grok_is_configured() -> bool:
