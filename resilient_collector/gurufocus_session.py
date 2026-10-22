@@ -193,6 +193,9 @@ async def _wait_out_cloudflare(page: Page, timeout_ms: int = GURUFOCUS_CF_WAIT_M
             title = (await page.title() or "").lower()
         except Exception:
             continue
+        if "access denied" in title:
+            logger.warning("[gurufocus] Cloudflare access denied; title=%r", await page.title())
+            return False
         if "attention required" not in title and "just a moment" not in title:
             logger.info("[gurufocus] Cloudflare challenge cleared; title=%r", await page.title())
             return True

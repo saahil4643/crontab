@@ -706,6 +706,9 @@ async def _gurufocus_wait_out_cloudflare(page: Page, ticker: str, timeout_ms: in
             title = (await page.title() or "").lower()
         except Exception:
             continue
+        if "access denied" in title:
+            logger.warning("[%s] GuruFocus Cloudflare access denied; title=%r", ticker, await page.title())
+            return 403
         if "attention required" not in title and "just a moment" not in title:
             logger.info("[%s] GuruFocus Cloudflare challenge cleared; title=%r", ticker, await page.title())
             return 200
