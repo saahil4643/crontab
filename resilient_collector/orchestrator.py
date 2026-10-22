@@ -1081,25 +1081,20 @@ async def _process_job_on_page(
     job: ScrapeJob,
     proxy_label: str,
 ) -> TickerResult:
-    grok_primary_sources = {
-        s.strip().lower()
-        for s in os.environ.get("GROK_PRIMARY_FOR", "").split(",")
-        if s.strip()
-    }
-    if grok_is_configured() and job.source in grok_primary_sources:
+    if ai_is_configured() and job.source in ai_primary_sources():
         logger.info(
-            "[%s] Fetching %s metric directly via Grok AI (configured in GROK_PRIMARY_FOR)...",
+            "[%s] Fetching %s metric directly via AI (configured in AI_PRIMARY_FOR)...",
             job.ticker,
             job.source,
         )
-        grok_val = await fetch_metric_from_grok(job.ticker, job.source)
-        if grok_val:
+        ai_val = await fetch_ai_valuation_metric(job.ticker, job.source)
+        if ai_val:
             return TickerResult(
                 ticker=job.ticker,
                 success=True,
-                source=f"grok_ai_{job.source}",
-                metric=grok_val,
-                proxy="xai_grok",
+                source=f"ai_{job.source}",
+                metric=ai_val,
+                proxy="ai_search",
             )
 
     try:
@@ -1118,20 +1113,20 @@ async def _process_job_on_page(
             job.source,
             primary_exc,
         )
-        if grok_is_configured():
+        if ai_is_configured():
             logger.info(
-                "[%s] Attempting Grok AI web search fallback for %s...",
+                "[%s] Attempting AI live web search fallback for %s...",
                 job.ticker,
                 job.source,
             )
-            grok_val = await fetch_metric_from_grok(job.ticker, job.source)
-            if grok_val:
+            ai_val = await fetch_ai_valuation_metric(job.ticker, job.source)
+            if ai_val:
                 return TickerResult(
                     ticker=job.ticker,
                     success=True,
-                    source=f"grok_ai_{job.source}",
-                    metric=grok_val,
-                    proxy="xai_grok",
+                    source=f"ai_{job.source}",
+                    metric=ai_val,
+                    proxy="ai_search",
                 )
         return TickerResult(
             ticker=job.ticker,
