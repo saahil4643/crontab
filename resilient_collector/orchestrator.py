@@ -48,7 +48,7 @@ from sheet_client import DcfSheetClient
 from sheet_utils import has_stored_cell_value
 from sheet_write_buffer import SheetWriteBuffer
 from worker_shutdown import ShutdownController, interruptible_sleep
-from resilient_collector.grok_collector import fetch_metric_from_grok, grok_is_configured
+from resilient_collector.ai_fallback import ai_is_configured, ai_primary_sources, fetch_ai_valuation_metric
 
 logger = logging.getLogger(__name__)
 
@@ -340,25 +340,20 @@ async def process_job(
     context: BrowserContext | None = None
     page: Page | None = None
 
-    grok_primary_sources = {
-        s.strip().lower()
-        for s in os.environ.get("GROK_PRIMARY_FOR", "").split(",")
-        if s.strip()
-    }
-    if grok_is_configured() and job.source in grok_primary_sources:
+    if ai_is_configured() and job.source in ai_primary_sources():
         logger.info(
-            "[%s] Fetching %s metric directly via Grok AI (configured in GROK_PRIMARY_FOR)...",
+            "[%s] Fetching %s metric directly via AI (configured in AI_PRIMARY_FOR)...",
             job.ticker,
             job.source,
         )
-        grok_val = await fetch_metric_from_grok(job.ticker, job.source)
-        if grok_val:
+        ai_val = await fetch_ai_valuation_metric(job.ticker, job.source)
+        if ai_val:
             return TickerResult(
                 ticker=job.ticker,
                 success=True,
-                source=f"grok_ai_{job.source}",
-                metric=grok_val,
-                proxy="xai_grok",
+                source=f"ai_{job.source}",
+                metric=ai_val,
+                proxy="ai_search",
             )
 
     try:
@@ -390,20 +385,20 @@ async def process_job(
                     job.source,
                     primary_exc,
                 )
-                if grok_is_configured():
+                if ai_is_configured():
                     logger.info(
-                        "[%s] Attempting Grok AI web search fallback for %s...",
+                        "[%s] Attempting AI live web search fallback for %s...",
                         job.ticker,
                         job.source,
                     )
-                    grok_val = await fetch_metric_from_grok(job.ticker, job.source)
-                    if grok_val:
+                    ai_val = await fetch_ai_valuation_metric(job.ticker, job.source)
+                    if ai_val:
                         return TickerResult(
                             ticker=job.ticker,
                             success=True,
-                            source=f"grok_ai_{job.source}",
-                            metric=grok_val,
-                            proxy="xai_grok",
+                            source=f"ai_{job.source}",
+                            metric=ai_val,
+                            proxy="ai_search",
                         )
                 return TickerResult(
                     ticker=job.ticker,
@@ -561,24 +556,19 @@ async def _process_gurufocus_with_session(
 ) -> TickerResult:
     proxy_label = session.proxy_label
 
-    grok_primary_sources = {
-        s.strip().lower()
-        for s in os.environ.get("GROK_PRIMARY_FOR", "").split(",")
-        if s.strip()
-    }
-    if grok_is_configured() and ("gurufocus" in grok_primary_sources or job.source in grok_primary_sources):
+    if ai_is_configured() and ("gurufocus" in ai_primary_sources() or job.source in ai_primary_sources()):
         logger.info(
-            "[%s] Fetching gurufocus metric directly via Grok AI (configured in GROK_PRIMARY_FOR)...",
+            "[%s] Fetching gurufocus metric directly via AI (configured in AI_PRIMARY_FOR)...",
             job.ticker,
         )
-        grok_val = await fetch_metric_from_grok(job.ticker, "gurufocus")
-        if grok_val:
+        ai_val = await fetch_ai_valuation_metric(job.ticker, "gurufocus")
+        if ai_val:
             return TickerResult(
                 ticker=job.ticker,
                 success=True,
-                source="grok_ai_gurufocus",
-                metric=grok_val,
-                proxy="xai_grok",
+                source="ai_gurufocus",
+                metric=ai_val,
+                proxy="ai_search",
             )
 
     async def _scrape_once() -> TickerResult:
@@ -637,19 +627,19 @@ async def _process_gurufocus_with_session(
 
     assert last_primary_exc is not None
     logger.warning("[%s] gurufocus primary failed (%s)", job.ticker, last_primary_exc)
-    if grok_is_configured():
+    if ai_is_configured():
         logger.info(
-            "[%s] gurufocus direct scrape blocked; attempting Grok AI web search fallback...",
+            "[%s] gurufocus direct scrape blocked; attempting AI live web search fallback...",
             job.ticker,
         )
-        grok_val = await fetch_metric_from_grok(job.ticker, "gurufocus")
-        if grok_val:
+        ai_val = await fetch_ai_valuation_metric(job.ticker, "gurufocus")
+        if ai_val:
             return TickerResult(
                 ticker=job.ticker,
                 success=True,
-                source="grok_ai_gurufocus",
-                metric=grok_val,
-                proxy="xai_grok",
+                source="ai_gurufocus",
+                metric=ai_val,
+                proxy="ai_search",
             )
     session.record_view()
     return TickerResult(

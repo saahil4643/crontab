@@ -72,7 +72,7 @@ async def main_async() -> int:
 
     print("\n" + "=" * 65)
     if metric:
-        print(f"[✓ SUCCESS] {ticker} {source} DCF Fair Value -> ${metric}")
+        print(f"[SUCCESS] {ticker} {source} DCF Fair Value -> ${metric}")
         print(f"[*] Time taken: {elapsed:.2f} seconds")
         print("=" * 65)
         return 0
