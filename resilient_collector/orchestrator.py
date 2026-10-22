@@ -561,6 +561,26 @@ async def _process_gurufocus_with_session(
 ) -> TickerResult:
     proxy_label = session.proxy_label
 
+    grok_primary_sources = {
+        s.strip().lower()
+        for s in os.environ.get("GROK_PRIMARY_FOR", "").split(",")
+        if s.strip()
+    }
+    if grok_is_configured() and ("gurufocus" in grok_primary_sources or job.source in grok_primary_sources):
+        logger.info(
+            "[%s] Fetching gurufocus metric directly via Grok AI (configured in GROK_PRIMARY_FOR)...",
+            job.ticker,
+        )
+        grok_val = await fetch_metric_from_grok(job.ticker, "gurufocus")
+        if grok_val:
+            return TickerResult(
+                ticker=job.ticker,
+                success=True,
+                source="grok_ai_gurufocus",
+                metric=grok_val,
+                proxy="xai_grok",
+            )
+
     async def _scrape_once() -> TickerResult:
         page = await session.ensure_page()
         primary = await extract_gurufocus_metric(page, job)
@@ -617,6 +637,20 @@ async def _process_gurufocus_with_session(
 
     assert last_primary_exc is not None
     logger.warning("[%s] gurufocus primary failed (%s)", job.ticker, last_primary_exc)
+    if grok_is_configured():
+        logger.info(
+            "[%s] gurufocus direct scrape blocked; attempting Grok AI web search fallback...",
+            job.ticker,
+        )
+        grok_val = await fetch_metric_from_grok(job.ticker, "gurufocus")
+        if grok_val:
+            return TickerResult(
+                ticker=job.ticker,
+                success=True,
+                source="grok_ai_gurufocus",
+                metric=grok_val,
+                proxy="xai_grok",
+            )
     session.record_view()
     return TickerResult(
         ticker=job.ticker,
