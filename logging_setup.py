@@ -55,11 +55,15 @@ def setup_logging(*, also_stdout: bool | None = None) -> tuple[logging.Logger, s
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
+    _worker_logger.propagate = True
+
     if also_stdout:
         target_stream = sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
         stream_handler = logging.StreamHandler(target_stream)
         stream_handler.setFormatter(fmt)
         root.addHandler(stream_handler)
+        if stream_handler not in _worker_logger.handlers:
+            _worker_logger.addHandler(stream_handler)
 
     log_run_banner(_worker_logger, JOB_NAME, "worker")
     _worker_logger.info("worker log_file=%s", log_path)

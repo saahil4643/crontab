@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="Max sheet jobs to process")
     parser.add_argument("--source", action="append", dest="sources", metavar="SOURCE", help="Sheet source to process; repeatable")
     parser.add_argument("--reset-progress", action="store_true", help="Clear cycle_progress.json to re-process all rows")
+    parser.add_argument("--clean-locks", action="store_true", help="Remove stale PID and lock files before running")
     return parser
 
 
@@ -104,6 +105,7 @@ def with_xvfb(command: list[str]) -> tuple[list[str], dict[str, str]]:
 def maybe_reexec_with_xvfb(args: argparse.Namespace) -> None:
     if not should_use_xvfb(args):
         return
+    print("[*] Launching with xvfb-run for virtual display...", flush=True)
     command, env = with_xvfb([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
     os.execvpe(command[0], command, env)
 
@@ -217,9 +219,18 @@ if __name__ == "__main__":
     if args.background:
         raise SystemExit(start_background(sys.argv[1:]))
 
+    if args.clean_locks or args.reset_progress:
+        if PID_FILE.exists():
+            with suppress(OSError):
+                PID_FILE.unlink()
+        if LOCK_FILE.exists():
+            with suppress(OSError):
+                LOCK_FILE.unlink()
+
     if args.reset_progress:
         from resilient_collector.progress_tracker import clear_progress
         clear_progress()
+        print("[*] Cleared cycle progress; re-processing all sheet rows.", flush=True)
 
     maybe_reexec_with_xvfb(args)
 
@@ -246,6 +257,9 @@ if __name__ == "__main__":
             status = "refused"
             failure_reason = f"already_running pid={running_pid}"
             exit_code = 1
+            print(f"\n[!] Worker refused to start: {failure_reason}")
+            print(f"    Another instance is already running (PID {running_pid}).")
+            print(f"    If that process is no longer active, run with --clean-locks\n", flush=True)
             worker_logger.warning("Worker refused: %s", failure_reason)
             log_run_summary(
                 worker_logger,
@@ -261,6 +275,9 @@ if __name__ == "__main__":
             status = "refused"
             failure_reason = "instance_lock_busy"
             exit_code = 1
+            print(f"\n[!] Worker refused to start: {failure_reason}")
+            print(f"    Instance lock file ({LOCK_FILE}) is currently busy.")
+            print(f"    Run with --clean-locks if the previous process terminated.\n", flush=True)
             worker_logger.warning("Worker refused: %s", failure_reason)
             log_run_summary(
                 worker_logger,
